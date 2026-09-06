@@ -1,0 +1,117 @@
+"""No torch/ONNX/CUDA imports or model execution: packing, paths, splits, metrics."""
+import json
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import check_splits, load_config, prepare_manifests, read_json, read_manifest, safetensor_header
+from torch_work import unpack_awq_numpy
+from trt_vision_check import feature_metrics, profile_shapes
+
+
+class PackingTests(unittest.TestCase):
+    def test_all_signed_nibbles_and_output_axis(self):
+        values = np.arange(-8, 8, dtype=np.int8).reshape(4, 4)
+        packed = ((values[0::2].astype(np.int16) & 15) |
+                  ((values[1::2].astype(np.int16) & 15) << 4)).astype(np.uint8)
+        np.testing.assert_array_equal(unpack_awq_numpy(packed), values)
+
+    def test_known_byte(self):
+        actual = unpack_awq_numpy(np.array([[0x87, 0xF1]], dtype=np.uint8))
+        np.testing.assert_array_equal(actual, [[7, 1], [-8, -1]])
+
+    def test_reject_autoawq_int32(self):
+        with self.assertRaises(ValueError):
+            unpack_awq_numpy(np.ones((2, 8), dtype=np.int32))
+
+    def test_reject_wrong_rank(self):
+        with self.assertRaises(ValueError):
+            unpack_awq_numpy(np.ones(8, dtype=np.uint8))
+
+
+class FileTests(unittest.TestCase):
+    def test_safetensors_valid_and_truncated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "model.safetensors"
+            header = json.dumps({"x": {"dtype": "U8", "shape": [2], "data_offsets": [0, 2]}}).encode()
+            path.write_bytes(struct.pack("<Q", len(header)) + header + b"\x12\x34")
+            self.assertEqual(safetensor_header(path)["x"]["shape"], [2])
+            path.write_bytes(struct.pack("<Q", len(header)) + header + b"\x12")
+            with self.assertRaises(ValueError):
+                safetensor_header(path)
+
+    def test_relative_manifest_and_split(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "image.png").write_bytes(b"image fixture")
+            path = root / "samples.jsonl"
+            path.write_text(json.dumps({"id": "a", "image": "image.png", "question": "describe"}) + "\n", encoding="utf-8")
+            records = read_manifest(path, require_image=True)
+            self.assertEqual(records[0]["image"], str((root / "image.png").resolve()))
+            with self.assertRaises(ValueError):
+                check_splits(records, records)
+            check_splits(records, [{"id": "text", "question": "hello"}])
+
+    def test_dedup_and_reproducible_prepare(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "images"
+            source.mkdir()
+            for i in range(7):
+                Image.new("RGB", (32+i, 32), (i*20, 1, 2)).save(source / f"{i}.png")
+            Image.open(source / "0.png").save(source / "duplicate.png")
+            cfg = {"images": str(source), "seed": 42, "calibration_samples": 4, "evaluation_samples": 2}
+            first = prepare_manifests(cfg, root / "first")
+            second = prepare_manifests(cfg, root / "second")
+            self.assertEqual((first / "calib.jsonl").read_bytes(), (second / "calib.jsonl").read_bytes())
+            self.assertEqual(read_json(first / "manifest_info.json")["unique_decoded_images"], 7)
+            check_splits(read_manifest(first / "calib.jsonl", True), read_manifest(first / "eval.jsonl"))
+            with self.assertRaises(FileExistsError):
+                prepare_manifests(cfg, first)
+
+    def test_split_duplicates_rejected(self):
+        calib = [{"image": "a", "image_sha256": "one"}]
+        evaluation = [{"image": "b", "image_sha256": "two"}] * 2
+        with self.assertRaises(ValueError):
+            check_splits(calib, evaluation)
+        with self.assertRaises(ValueError):
+            check_splits(calib * 2, [])
+
+    def test_config_resolves_root_and_limits(self):
+        config = Path(__file__).resolve().parents[1] / "config.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg = load_config(config, temporary)
+            self.assertTrue(Path(cfg["original"]).is_absolute())
+            self.assertEqual(cfg["calibration_samples"], 256)
+            self.assertLessEqual(cfg["max_input_tokens"] + cfg["max_new_tokens"], cfg["kv_cache_capacity"])
+
+
+class MetricTests(unittest.TestCase):
+    def test_identical(self):
+        values = np.array([[1, 2, 3], [-1, 3, 1]], dtype=np.float16)
+        result = feature_metrics(values, values)
+        self.assertAlmostEqual(result["mean_token_cosine"], 1)
+        self.assertEqual(result["relative_l2"], 0)
+
+    def test_nonfinite_and_shapes(self):
+        with self.assertRaises(ValueError):
+            feature_metrics(np.zeros((2, 3)), np.zeros((3, 2)))
+        with self.assertRaises(ValueError):
+            feature_metrics(np.ones((2, 3)), np.full((2, 3), np.nan))
+
+    def test_profile_contract(self):
+        shapes = profile_shapes(256)
+        self.assertEqual(shapes["input"], (256, 1536))
+        self.assertEqual(shapes["fast_pos_embed_idx"], (4, 256))
+        self.assertEqual(shapes["cu_seqlens"], (2,))
+        self.assertEqual(shapes["rotary_pos_emb"], (256, 32))
+
+
+if __name__ == "__main__":
+    unittest.main()

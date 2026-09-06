@@ -1,0 +1,24 @@
+{
+  "checked_on": "2026-09-06",
+  "local_root": "E:/work/cpp/Qwen3_VL_2B",
+  "local_gpu_work_performed": false,
+  "cpu_unit_tests": {"passed": 12, "failed": 0},
+  "python_ast_files_checked": 6,
+  "shell_line_endings": "LF without BOM",
+  "server_quantization_performed": false,
+  "jetson_fit_verified": false,
+  "dataset": {
+    "folder": "dataset/JPEGImages",
+    "readable_images": 528,
+    "unique_file_hashes": 528,
+    "unique_decoded_pixel_hashes": 528,
+    "unreadable": 0,
+    "dimensions": {"384x288": 199, "960x720": 149, "880x600": 132, "640x352": 48},
+    "planned_calibration": 256,
+    "planned_evaluation": 32,
+    "planned_unused": 240,
+    "near_duplicates_checked": false
+  },
+  "checkpoint_headers": {"original_tensors": 625, "awq_tensors": 1017, "llm_onnx_version": "0.10.1"},
+  "note": "Local file/header/image checks only. The scripts still require Linux CUDA server execution. No model accuracy or device memory result is claimed."
+}

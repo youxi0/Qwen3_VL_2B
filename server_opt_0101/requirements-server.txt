@@ -1,0 +1,3 @@
+# Match the official Edge-LLM v0.10.1 tools extra. Install on the Linux server only.
+tensorrt-edgellm[tools]==0.10.1
+Pillow>=10.4,<13
