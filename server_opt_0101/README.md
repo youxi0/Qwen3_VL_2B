@@ -149,3 +149,19 @@ run-vision-int8-v1/
 ```bash
 python -B -m unittest discover -s server_opt_0101/tests -v
 ```
+
+### 已修复：对齐时 mask 103 与 token type 71 长度不一致
+
+早期 `continuation_logits()` 追加回答 Token 时只扩展了 `input_ids` 和
+`attention_mask`，漏掉 Transformers 5.14.1 的 `mm_token_type_ids`。
+现已通过 `continuation_inputs()` 保留原始多模态类型，并为新增文本补类型0，
+同时重新计算全序列位置。该修复作用于原模型、AWQ 和组合模型的对齐。
+
+已有服务器环境只需更新 `server_opt_0101/torch_work.py`；无需更换依赖、模型、
+`config.json` 或重新生成数据清单。重跑时使用新的 `--out` 目录保留失败日志。
+如上传新增的 `tests/test_continuation.py`，可以先用下面命令在服务器做无模型、
+无 CUDA 的回归测试（包含真实 PyTorch CPU 张量测试）：
+
+```bash
+python -B -m unittest discover -s server_opt_0101/tests -p 'test_continuation.py' -v
+```

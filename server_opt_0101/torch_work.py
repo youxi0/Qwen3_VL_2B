@@ -204,12 +204,45 @@ def greedy(model, inputs, cfg):
     return generated[:, inputs["input_ids"].shape[1]:].detach()
 
 
+def continuation_inputs(inputs, continuation):
+    """Append a text answer without leaving prompt-length multimodal metadata.
+
+    Transformers 5.14.1 uses mm_token_type_ids to build M-RoPE positions:
+    0=text, 1=image, 2=video. Preserve the prompt types and append text zeros.
+    This is a fresh full-sequence forward, not a cached generation step.
+    """
+    import torch
+    prompt_ids = inputs["input_ids"]
+    if len(prompt_ids.shape) != 2 or len(continuation.shape) != 2:
+        raise ValueError("Prompt and continuation must both have shape [batch, sequence]")
+    if prompt_ids.shape[0] != continuation.shape[0] or continuation.shape[1] == 0:
+        raise ValueError("Continuation must be non-empty and match the prompt batch size")
+    attention_mask = inputs["attention_mask"]
+    if tuple(attention_mask.shape) != tuple(prompt_ids.shape):
+        raise ValueError("Prompt attention_mask must match input_ids before appending text")
+    kwargs = dict(inputs)
+    kwargs["input_ids"] = torch.cat([prompt_ids, continuation], dim=1)
+    kwargs["attention_mask"] = torch.cat(
+        [attention_mask, torch.ones_like(continuation, dtype=attention_mask.dtype)], dim=1)
+    mm_types = inputs.get("mm_token_type_ids")
+    if mm_types is not None:
+        if tuple(mm_types.shape) != tuple(prompt_ids.shape):
+            raise ValueError("Prompt mm_token_type_ids must match input_ids before appending text")
+        kwargs["mm_token_type_ids"] = torch.cat(
+            [mm_types, torch.zeros_like(continuation, dtype=mm_types.dtype)], dim=1)
+    elif inputs.get("image_grid_thw") is not None or inputs.get("video_grid_thw") is not None:
+        raise ValueError("Multimodal teacher forcing requires processor-provided mm_token_type_ids")
+    # Let Qwen3-VL regenerate positions for the entire extended sequence.
+    kwargs.pop("position_ids", None)
+    kwargs.pop("cache_position", None)
+    kwargs.pop("past_key_values", None)
+    return kwargs
+
+
 def continuation_logits(model, inputs, continuation):
     import torch
-    kwargs = dict(inputs)
+    kwargs = continuation_inputs(inputs, continuation)
     prompt_length = inputs["input_ids"].shape[1]
-    kwargs["input_ids"] = torch.cat([inputs["input_ids"], continuation], dim=1)
-    kwargs["attention_mask"] = torch.cat([inputs["attention_mask"], torch.ones_like(continuation)], dim=1)
     reset_rope(model)
     with torch.inference_mode():
         out = model(**kwargs, use_cache=False, return_dict=True)
