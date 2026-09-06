@@ -165,3 +165,29 @@ python -B -m unittest discover -s server_opt_0101/tests -v
 ```bash
 python -B -m unittest discover -s server_opt_0101/tests -p 'test_continuation.py' -v
 ```
+
+### 已加入保护：SmoothQuant 的零通道产生 NaN
+
+ModelOpt 0.45.0 在计算平滑系数时可能遇到 `0/0`；其限幅不会消除 NaN，
+因此在 `pre_quant_scale should be positive` 处失败。只读检查本地原始权重发现，
+第0层 Vision MLP 的通道1590在 FP16 下有零权重行/列，可触发这个边界情况。
+
+`torch_work.py` 现在为官方平滑系数应用函数加一个临时、进程内的保护：仅当
+实际权重列最大值和校准激活最大值均严格为0时，才把该通道的 NaN 系数设为1；
+其他 NaN/Inf、非正 scale、异常统计或非白名单层仍会报错。不修改安装包文件，
+退出作用域时恢复原函数；不要在同一进程的多个线程中同时执行量化。
+正常通道仍使用官方 SmoothQuant 算法，保留权重重校准与导出状态。
+
+若实际触发修复，日志显示 `[SmoothQuant zero-channel repair]` 和层名/通道，
+正式报告 `vision_quantization.json` 的 `smoothquant_scale_checks` 记录详情。
+另检查只有目标100层对应的200个输入/权重量化器被启用；插入1224个量化器
+不等于1224个全部启用。原 AWQ 和 Vision 量化范围不变。
+
+服务器只需更新 `torch_work.py`，继续使用原数据清单并换一个新的输出目录。
+可先上传 `tests/test_smoothquant_guard.py` 并执行以下小型CPU测试，不加载模型权重：
+
+```bash
+python -B -m unittest discover -s server_opt_0101/tests -p 'test_smoothquant_guard.py' -v
+```
+
+本地仅完成 NumPy 数值/形状回归测试，真实 ModelOpt 集成测试需在服务器运行。

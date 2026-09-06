@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import gc
 import json
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from common import checkpoint_index, read_json, write_json
@@ -378,6 +378,89 @@ def collect_vision_reference(model, processor, records, cfg, output):
     return refs
 
 
+def repair_zero_channel_sq_scale(scale, activation_amax, weight_amax, module_name):
+    """Repair only proven 0/0 channels; never hide invalid live-channel data.
+
+    ModelOpt 0.45.0 clamps its scale before calling the smoothing helper, but
+    clamp leaves NaN unchanged. For an exactly zero weight column AND exactly
+    zero observed activation channel, a neutral multiplier of 1 is equivalent.
+    Arrays are small FP32 per-input-channel vectors, not full model weights.
+    """
+    import numpy as np
+    values = np.asarray(scale, dtype=np.float32).reshape(-1).copy()
+    act = np.asarray(activation_amax, dtype=np.float32).reshape(-1)
+    weight = np.asarray(weight_amax, dtype=np.float32).reshape(-1)
+    if not values.size or values.shape != act.shape or values.shape != weight.shape:
+        raise ValueError(f"SmoothQuant {module_name}: scale/activation/weight channel shapes disagree")
+    if not np.isfinite(act).all() or not np.isfinite(weight).all() or (act < 0).any() or (weight < 0).any():
+        raise ValueError(f"SmoothQuant {module_name}: non-finite or negative amax; not a safe zero-channel repair")
+    zero_pair = (act == 0) & (weight == 0)
+    repair = np.isnan(values) & zero_pair
+    invalid = ~np.isfinite(values) | (values <= 0)
+    unsafe = invalid & ~repair
+    if unsafe.any():
+        channels = np.flatnonzero(unsafe)[:16].tolist()
+        raise ValueError(f"SmoothQuant {module_name}: invalid scales on channels {channels}; "
+                         "only NaN from confirmed zero activation AND zero weight may be repaired")
+    values[repair] = 1.0
+    details = {"module": module_name, "channels": int(values.size),
+               "zero_activation_channels": int((act == 0).sum()),
+               "zero_weight_columns": int((weight == 0).sum()),
+               "repaired_zero_over_zero_count": int(repair.sum()),
+               "repaired_channel_indices": np.flatnonzero(repair).tolist()}
+    return values, details
+
+
+@contextmanager
+def modelopt_smoothquant_zero_guard(model, targets):
+    """Scoped workaround for ModelOpt 0.45.0; package files stay untouched.
+
+    Keep official calibration, smoothing, weight recalibration and export state.
+    Intercept only the point immediately before applying a calculated scale.
+    This process-local hook is intended for this single-model CLI, not concurrent
+    quantization threads. Restore it even if calibration raises an exception.
+    """
+    import torch
+    from modelopt.torch.quantization import model_calib
+    original = model_calib.apply_pre_quant_scale_and_smooth
+    allowed = set(targets)
+    module_names = None
+    checked = []
+
+    def guarded_apply(linear, pre_quant_scale=None):
+        nonlocal module_names
+        # Resolve after mtq.quantize has converted/replaced modules.
+        if module_names is None:
+            module_names = {id(module): name for name, module in model.named_modules()}
+        name = module_names.get(id(linear), "<unknown>")
+        if name not in allowed:
+            raise ValueError(f"SmoothQuant tried to smooth non-whitelisted layer {name}")
+        act = getattr(linear.input_quantizer, "_amax_for_smoothing", None)
+        if pre_quant_scale is None or act is None:
+            raise ValueError(f"SmoothQuant {name}: expected ModelOpt 0.45.0 scale and channel statistics")
+        with torch.no_grad():
+            weight_amax = linear.weight.detach().float().abs().amax(dim=0)
+            fixed, details = repair_zero_channel_sq_scale(
+                pre_quant_scale.detach().float().cpu().numpy(),
+                act.detach().float().cpu().numpy(),
+                weight_amax.cpu().numpy(), name)
+            checked.append(details)
+            if details["repaired_zero_over_zero_count"]:
+                print("[SmoothQuant zero-channel repair] " + json.dumps(details), flush=True)
+                pre_quant_scale = torch.from_numpy(fixed).to(
+                    device=pre_quant_scale.device, dtype=pre_quant_scale.dtype).reshape(pre_quant_scale.shape)
+            try:
+                return original(linear, pre_quant_scale)
+            except Exception as exc:
+                raise RuntimeError(f"SmoothQuant apply failed in {name}: {exc}") from exc
+
+    model_calib.apply_pre_quant_scale_and_smooth = guarded_apply
+    try:
+        yield checked
+    finally:
+        model_calib.apply_pre_quant_scale_and_smooth = original
+
+
 def quantize_vision(model, processor, calibration, cfg):
     import torch
     import modelopt.torch.quantization as mtq
@@ -412,7 +495,17 @@ def quantize_vision(model, processor, calibration, cfg):
                 if not torch.isfinite(output.pooler_output).all():
                     raise ValueError(f"Non-finite calibration sample: {row['id']}")
 
-    mtq.quantize(model, recipe, forward_loop=forward_loop)
+    with modelopt_smoothquant_zero_guard(model, targets) as smoother_checks:
+        mtq.quantize(model, recipe, forward_loop=forward_loop)
+    if {row["module"] for row in smoother_checks} != set(targets) or len(smoother_checks) != len(targets):
+        raise ValueError("SmoothQuant did not process exactly the whitelisted Vision layers")
+    from modelopt.torch.quantization.nn import TensorQuantizer
+    enabled = {name for name, quantizer in model.named_modules()
+               if isinstance(quantizer, TensorQuantizer) and quantizer.is_enabled}
+    expected_enabled = {name + suffix for name in targets for suffix in (".input_quantizer", ".weight_quantizer")}
+    if enabled != expected_enabled:
+        raise ValueError(f"Vision quantizer whitelist mismatch: extra={sorted(enabled-expected_enabled)}, "
+                         f"missing={sorted(expected_enabled-enabled)}")
     summary = []
     for name in targets:
         layer = model.get_submodule(name)
@@ -427,7 +520,9 @@ def quantize_vision(model, processor, calibration, cfg):
                         "activation_amax": iq.amax.max().item(),
                         "smoother_min": pqs.min().item(), "smoother_max": pqs.max().item()})
     mtq.print_quant_summary(model)
-    return {"recipe": recipe, "quantized_modules": summary, "calibration_samples": len(calibration)}
+    return {"recipe": recipe, "quantized_modules": summary, "calibration_samples": len(calibration),
+            "enabled_quantizer_count": len(enabled), "smoothquant_scale_checks": smoother_checks,
+            "zero_channel_repair_policy": "Only NaN from exactly zero activation range AND zero weight column uses neutral scale 1; all other invalid statistics fail."}
 
 
 def compare_vision(model, processor, references, cfg):
