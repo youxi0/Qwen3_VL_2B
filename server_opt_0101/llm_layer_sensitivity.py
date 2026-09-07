@@ -28,6 +28,25 @@ MODULE_GROUPS = {
 }
 
 
+def expand_module_group(spec):
+    """Expand ``LAYER:GROUP`` into exact decoder Linear module names."""
+    try:
+        layer_text, group = spec.split(":", 1)
+        layer = int(layer_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid module group {spec!r}; use e.g. 3:mlp_down"
+        ) from exc
+    if not 0 <= layer < AWQ_DECODER_LAYER_COUNT or group not in MODULE_GROUPS:
+        raise ValueError(
+            f"Invalid module group {spec!r}; groups={list(MODULE_GROUPS)}"
+        )
+    return [
+        f"model.language_model.layers.{layer}.{suffix}"
+        for suffix in MODULE_GROUPS[group]
+    ]
+
+
 def aggregate(rows):
     total = sum(row["tokens"] for row in rows)
     return {
@@ -107,8 +126,12 @@ def main():
         "--joint-layers", type=int, nargs="*", default=[],
         help="Also evaluate these FP16 blocks together in one forward sweep",
     )
+    parser.add_argument(
+        "--joint-module", action="append", default=[],
+        help="Jointly restore LAYER:GROUP, e.g. 0:attention_qkv; repeat as needed",
+    )
     parser.add_argument("--joint-only", action="store_true",
-                        help="Skip individual scans and run only --joint-layers")
+                        help="Skip individual scans and run only joint recovery")
     parser.add_argument("--skip-lm-head", action="store_true")
     args = parser.parse_args()
 
@@ -133,8 +156,8 @@ def main():
         list(range(AWQ_DECODER_LAYER_COUNT))
         if args.layers is None else sorted(set(args.layers))
     )
-    if args.joint_only and not args.joint_layers:
-        raise ValueError("--joint-only requires --joint-layers")
+    if args.joint_only and not (args.joint_layers or args.joint_module):
+        raise ValueError("--joint-only requires --joint-layers or --joint-module")
     invalid = [layer for layer in requested
                if not 0 <= layer < AWQ_DECODER_LAYER_COUNT]
     invalid += [layer for layer in args.joint_layers
@@ -270,6 +293,39 @@ def main():
                 ",".join(map(str, joint_layers)), "joint_decoder_blocks",
                 metrics, baseline, extra,
             )
+            write_json(output, report)
+
+        if args.joint_module:
+            group_names = list(dict.fromkeys(args.joint_module))
+            exact_names = []
+            for spec in group_names:
+                exact_names.extend(expand_module_group(spec))
+            exact_names = sorted(set(exact_names) - already_fp16_modules)
+            if not exact_names:
+                raise ValueError("All requested joint module groups are already FP16")
+            saved = {}
+            try:
+                for name in exact_names:
+                    saved[name] = candidate.get_submodule(name)
+                    replace_named_submodule(candidate, name,
+                                            base.get_submodule(name))
+                metrics = score_logits_only(
+                    candidate, processor, references, cfg,
+                    "joint FP16 modules " + ",".join(group_names),
+                )
+            finally:
+                for name, module in saved.items():
+                    replace_named_submodule(candidate, name, module)
+            extra = sum(
+                tensor_bytes(original_index, name)
+                - tensor_bytes(awq_index, name)
+                for name in exact_names
+            ) / 2**20
+            report["joint_module_result"] = recovery_row(
+                ",".join(group_names), "joint_module_groups", metrics,
+                baseline, extra,
+            )
+            report["joint_module_result"]["exact_modules"] = exact_names
             write_json(output, report)
 
         if not args.skip_lm_head and layout["lm_head_int4"]:
