@@ -74,7 +74,8 @@ bash server_opt_0101/run_server.sh run \
 - AWQ 检查后端是 **反量化 FP16 数学参考，不是 TensorRT INT4 CUDA kernel**。它用于定位 checkpoint/量化质量问题；现有 LLM ONNX 仅结构与 sidecar 完整性检查，尚未验证它与 checkpoint 数值一致。最终仍需目标 LLM Engine 对齐。
 - Vision：从原始 FP16 模型校准，不从已量化 LLM 上再做第二次算法。100 个 Linear 使用静态 INT8 权重 + INT8 激活（W8A8）、权重按输出通道、激活按 Tensor，SmoothQuant alpha=0.5。实现依据 [ModelOpt 0.45 配置接口](https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/0.45.0/modelopt/torch/quantization/config.py)。
 - 默认 `conservative`：24 个 block 的 qkv/proj/fc1/fc2 共 96 层，加最终 merger / 三个 DeepStack merger 的 fc1 共 4 层。保留所有 merger 的 fc2、PatchEmbed、Norm、Softmax 和 Attention 核心为 FP16；最终输出及三路 DeepStack 仍为 FP16。不是“整座 Vision 每个算子均 INT8”。
-- 导出复用 [Edge-LLM 0.10.1 的 INT8SQLinear](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/v0.10.1/tensorrt_edgellm/models/linear.py) 和既有 ViT Attention Plugin；不写新 FC/GELU/Attention 插件，不把纯 FP16 图冒充量化图。检查 100 路 INT8 权重 DQ 和激活 Q/DQ。
+- `residual_fp16`：用于全 W8A8 误差逐层累积时的选择性混合精度。量化每个 block 的 qkv 和 MLP fc1，以及四个 merger fc1，共 52 层；把直接写入残差流的 attention proj 和 MLP fc2 保留为 FP16。这个范围预计比 `conservative` 少节省约 120 MiB，必须重新生成实际 `memory_budget.json`，不能只采用估算值。
+- 导出复用 [Edge-LLM 0.10.1 的 INT8SQLinear](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/v0.10.1/tensorrt_edgellm/models/linear.py) 和既有 ViT Attention Plugin；不写新 FC/GELU/Attention 插件，不把纯 FP16 图冒充量化图。按 recipe 严格检查 52/96/100/104 路 INT8 权重 DQ 和激活 Q/DQ。
 - 会另外把 AWQ LLM 与 fake-quant Vision 组合做第三组端到端数值比较，区分 LLM AWQ 误差、新增 Vision 误差及二者叠加。
 
 尺寸统一由原模型 processor 控制，保留长宽比并按 patch/merge 规则对齐；不是把所有图片强行拉伸成 256×256。`min_image_tokens=16`、`max_image_tokens=64` 对应处理后面积约 16,384～65,536 像素。原图可以更大，也可以尺寸各异。
@@ -138,7 +139,7 @@ run-vision-int8-v1/
 
 权重理论上可因本次100层 Vision INT8减少约352 MiB，但**量化后的逻辑权重字节数、磁盘 ONNX 大小、Engine 文件大小均不等于设备运行峰值内存**。若实际预留比本包假设更高，仍可能 OOM。3.6 的单位在配置中是 GiB，请按 Jetson `/proc/meminfo` 与实际空闲内存修正。
 
-数值或估算门槛未通过时，正式 run 返回状态码2，保留报告和带状态的候选文件，不自动覆盖/接受它。优先查看失败样本；不要仅放宽阈值让结果变绿。可分别尝试 alpha=0.3/0.7、`vision_recipe="blocks"`（96层，较保守）、`all_linears`（104层，更省权重但风险更高），每次用新输出目录、固定验证集对比。
+数值或估算门槛未通过时，正式 run 返回状态码2，保留报告和带状态的候选文件，不自动覆盖/接受它。优先查看失败样本；不要仅放宽阈值让结果变绿。可分别尝试不同 alpha、`vision_recipe="blocks"`（只量化96个 block Linear）、`residual_fp16`（52层，保护残差输出投影）或 `all_linears`（104层，更省权重但风险更高），每次用新输出目录、固定验证集对比。
 
 最后部署还缺两项不可用服务器估算替代的验证：实际 TensorRT INT4 LLM Engine 与 checkpoint 的数值/任务对齐；Jetson 原生运行时的总内存峰值和业务精度。如果本次不足3.6 GiB预算，后续再评估词表方案、运行时副本/工作区优化、KV限制或换更小模型，不能保证仅 Vision INT8 就够。
 

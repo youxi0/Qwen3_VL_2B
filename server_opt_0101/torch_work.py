@@ -10,6 +10,40 @@ from pathlib import Path
 from common import checkpoint_index, read_json, write_json
 
 
+VISION_RECIPE_EXPECTED = {
+    "blocks": 96,
+    "conservative": 100,
+    "residual_fp16": 52,
+    "all_linears": 104,
+}
+
+
+def vision_linear_is_target(name, recipe):
+    """Return whether a Qwen3-VL Vision Linear belongs to a named recipe.
+
+    ``residual_fp16`` keeps the two projections that write directly into each
+    transformer residual stream (attention proj and MLP fc2) in FP16.  It
+    still quantizes qkv, MLP fc1, and the four merger fc1 layers.
+    """
+    if recipe not in VISION_RECIPE_EXPECTED:
+        raise ValueError(
+            f"Unknown vision_recipe {recipe!r}; choose from "
+            f"{sorted(VISION_RECIPE_EXPECTED)}")
+    if not name.startswith("model.visual."):
+        return False
+    is_block = name.startswith("model.visual.blocks.")
+    if recipe == "all_linears":
+        return True
+    if recipe == "blocks":
+        return is_block
+    if recipe == "conservative":
+        return is_block or name.endswith(".linear_fc1")
+    return ((is_block and
+             (name.endswith(".attn.qkv") or
+              name.endswith(".mlp.linear_fc1"))) or
+            (not is_block and name.endswith(".linear_fc1")))
+
+
 def unpack_awq_numpy(packed):
     """ModelOpt W4A16: byte low/high nibbles are adjacent OUTPUT rows."""
     import numpy as np
@@ -464,18 +498,22 @@ def modelopt_smoothquant_zero_guard(model, targets):
 def quantize_vision(model, processor, calibration, cfg):
     import torch
     import modelopt.torch.quantization as mtq
+    recipe_name = cfg["vision_recipe"]
+    if recipe_name not in VISION_RECIPE_EXPECTED:
+        raise ValueError(
+            f"Unknown vision_recipe {recipe_name!r}; choose from "
+            f"{sorted(VISION_RECIPE_EXPECTED)}")
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear) or not name.startswith("model.visual."):
             continue
-        is_block = name.startswith("model.visual.blocks.")
-        keep = is_block or (cfg["vision_recipe"] != "blocks" and name.endswith("linear_fc1"))
-        keep |= cfg["vision_recipe"] == "all_linears"
-        if keep:
+        if vision_linear_is_target(name, recipe_name):
             targets.append(name)
-    expected = {"blocks": 96, "conservative": 100, "all_linears": 104}[cfg["vision_recipe"]]
+    expected = VISION_RECIPE_EXPECTED[recipe_name]
     if len(targets) != expected:
-        raise ValueError(f"Vision whitelist mismatch: expected {expected}, found {len(targets)}")
+        raise ValueError(
+            f"Vision {recipe_name} whitelist mismatch: expected {expected}, "
+            f"found {len(targets)}")
     recipe = copy.deepcopy(mtq.INT8_SMOOTHQUANT_CFG)
     recipe["quant_cfg"] = [{"quantizer_name": "*", "enable": False}]
     for name in targets:
