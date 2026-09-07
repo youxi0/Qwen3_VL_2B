@@ -47,6 +47,15 @@ def unpack_awq_numpy(packed):
     return pair.reshape(packed.shape[0] * 2, packed.shape[1])
 
 
+def replace_named_submodule(model, name, replacement):
+    """Replace either a nested module path or a root module such as lm_head."""
+    if "." not in name:
+        setattr(model, name, replacement)
+        return
+    parent_name, child = name.rsplit(".", 1)
+    setattr(model.get_submodule(parent_name), child, replacement)
+
+
 class TensorStore:
     def __init__(self, folder):
         from safetensors import safe_open
@@ -213,8 +222,8 @@ def load_awq_reference(cfg):
                 cosine = F.cosine_similarity(effective.flatten(), original.flatten(), dim=0)
                 stats.append({"module": name, "relative_weight_l2": rel.item(), "weight_cosine": cosine.item(),
                               "modelopt_repack_checked": len(stats) == 0})
-                parent_name, child = name.rsplit(".", 1)
-                setattr(model.get_submodule(parent_name), child, AWQReferenceLinear(dense, pqs, old.bias))
+                replace_named_submodule(
+                    model, name, AWQReferenceLinear(dense, pqs, old.bias))
     finally:
         source.close()
     return model.eval(), sorted(stats, key=lambda r: r["relative_weight_l2"], reverse=True)

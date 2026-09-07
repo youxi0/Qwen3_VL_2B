@@ -124,7 +124,7 @@ python server_opt_0101/requantize_awq_lm_head.py \
 USE_TRT_NATIVE_ATTN=0 python -m tensorrt_edgellm.scripts.export \
   outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-v0101 \
   outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-ONNX-v0101 \
-  --components llm \
+  --skip-visual \
   --dtype float16 \
   --externalize-weights int4_ffn
 ```

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import (check_splits, inspect_awq_modules, load_config,
                     prepare_manifests, read_json, read_manifest,
                     safetensor_header)
-from torch_work import unpack_awq_numpy
+from torch_work import replace_named_submodule, unpack_awq_numpy
 from trt_vision_check import (classify_feature_metrics, feature_metrics,
                               profile_shapes)
 
@@ -68,6 +68,23 @@ class PackingTests(unittest.TestCase):
         index["model.language_model.embed_tokens.weight"] = item()
         with self.assertRaises(ValueError):
             inspect_awq_modules(index)
+
+    def test_replace_root_and_nested_quantized_modules(self):
+        class Node:
+            def get_submodule(self, name):
+                current = self
+                for part in name.split("."):
+                    current = getattr(current, part)
+                return current
+
+        model = Node()
+        model.lm_head = "fp16-head"
+        model.model = Node()
+        model.model.proj = "fp16-proj"
+        replace_named_submodule(model, "lm_head", "int4-head")
+        replace_named_submodule(model, "model.proj", "int4-proj")
+        self.assertEqual(model.lm_head, "int4-head")
+        self.assertEqual(model.model.proj, "int4-proj")
 
 
 class FileTests(unittest.TestCase):
