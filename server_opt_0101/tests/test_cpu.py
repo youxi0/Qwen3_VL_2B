@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import (check_splits, inspect_awq_modules, load_config,
                     prepare_manifests, read_json, read_manifest,
                     safetensor_header)
-from requantize_awq_lm_head import (diversify_repeated_questions,
+from requantize_awq_lm_head import (configure_image_token_range,
+                                    diversify_repeated_questions,
                                     select_calibration_rows)
 from torch_work import replace_named_submodule, unpack_awq_numpy
 from trt_vision_check import (classify_feature_metrics, feature_metrics,
@@ -149,6 +150,24 @@ class FileTests(unittest.TestCase):
         diversified, changed = diversify_repeated_questions(rows)
         self.assertEqual(changed, 0)
         self.assertEqual({row["question"] for row in diversified}, {"same"})
+
+    def test_awq_image_range_matches_deployment_profile(self):
+        class ImageProcessor:
+            patch_size = 16
+            merge_size = 2
+            min_pixels = None
+            max_pixels = None
+
+        class Processor:
+            image_processor = ImageProcessor()
+
+        pixels = configure_image_token_range(Processor(), 16, 64)
+        self.assertEqual(pixels, 1024)
+        self.assertEqual(Processor.image_processor.size, {
+            "shortest_edge": 16384,
+            "longest_edge": 65536,
+        })
+        self.assertEqual(Processor.image_processor.max_pixels, 65536)
 
     def test_split_duplicates_rejected(self):
         calib = [{"image": "a", "image_sha256": "one"}]

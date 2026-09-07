@@ -111,6 +111,27 @@ def build_calibration_batches(processor, rows, max_seq_len):
     return batches, lengths
 
 
+def configure_image_token_range(processor, min_image_tokens, max_image_tokens):
+    """Match AWQ calibration image preprocessing to the deployment profile."""
+    image_processor = processor.image_processor
+    patch_size = int(image_processor.patch_size)
+    merge_size = int(image_processor.merge_size)
+    if patch_size != 16 or merge_size != 2:
+        raise ValueError(
+            "This calibration path is specific to Qwen3-VL patch=16, merge=2"
+        )
+    pixels_per_merged_token = (patch_size * merge_size) ** 2
+    image_processor.size = {
+        "shortest_edge": min_image_tokens * pixels_per_merged_token,
+        "longest_edge": max_image_tokens * pixels_per_merged_token,
+    }
+    if hasattr(image_processor, "min_pixels"):
+        image_processor.min_pixels = image_processor.size["shortest_edge"]
+    if hasattr(image_processor, "max_pixels"):
+        image_processor.max_pixels = image_processor.size["longest_edge"]
+    return pixels_per_merged_token
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
@@ -126,6 +147,8 @@ def main():
     parser.add_argument("--alpha-step", type=float, default=0.05,
                         help="AWQ alpha search step; ModelOpt default is 0.1")
     parser.add_argument("--max-seq-len", type=int, default=512)
+    parser.add_argument("--min-image-tokens", type=int, default=16)
+    parser.add_argument("--max-image-tokens", type=int, default=64)
     parser.add_argument("--keep-image-questions", action="store_true",
                         help="Do not diversify repeated unlabeled image questions")
     parser.add_argument("--seed", type=int, default=42)
@@ -141,6 +164,10 @@ def main():
         raise ValueError("--alpha-step must be in (0, 1]")
     if args.max_seq_len < 32:
         raise ValueError("--max-seq-len must be at least 32")
+    if not 1 <= args.min_image_tokens <= args.max_image_tokens:
+        raise ValueError(
+            "Expected 1 <= --min-image-tokens <= --max-image-tokens"
+        )
 
     image_rows = read_manifest(args.calib, require_image=True)
 
@@ -195,13 +222,32 @@ def main():
     def mixed_loader(processor, image_dataset, num_samples=128,
                      max_length=512, is_phi4mm=False):
         del image_dataset, num_samples, max_length, is_phi4mm
+        configure_image_token_range(
+            processor, args.min_image_tokens, args.max_image_tokens
+        )
         batches, lengths = build_calibration_batches(
             processor, rows, args.max_seq_len
         )
+        observed_image_tokens = []
+        for row, batch in zip(rows, batches):
+            if not row.get("image"):
+                continue
+            grid = batch.get("image_grid_thw")
+            if grid is None:
+                raise ValueError(f"{row['id']}: processor returned no image_grid_thw")
+            token_count = int(grid.prod(dim=-1).sum().item()) // 4
+            if not args.min_image_tokens <= token_count <= args.max_image_tokens:
+                raise ValueError(
+                    f"{row['id']}: processed image has {token_count} visual "
+                    f"tokens, outside {args.min_image_tokens}..{args.max_image_tokens}"
+                )
+            observed_image_tokens.append(token_count)
         batch_metadata.update({
             "sequence_token_min": min(lengths),
             "sequence_token_max": max(lengths),
             "sequence_token_mean": sum(lengths) / len(lengths),
+            "observed_image_token_min": min(observed_image_tokens),
+            "observed_image_token_max": max(observed_image_tokens),
         })
         return batches
 
@@ -261,6 +307,8 @@ def main():
         "diversified_repeated_image_questions": diversified,
         "awq_alpha_step": args.alpha_step,
         "max_sequence_tokens": args.max_seq_len,
+        "min_image_tokens": args.min_image_tokens,
+        "max_image_tokens": args.max_image_tokens,
         **batch_metadata,
         "seed": args.seed,
         "layout": {k: v for k, v in layout.items() if k != "packed_modules"},
