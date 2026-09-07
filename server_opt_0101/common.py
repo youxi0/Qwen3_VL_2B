@@ -36,6 +36,16 @@ VISION_RECIPE_EXPECTED = {
     "all_linears": 104,
 }
 AWQ_BACKBONE_LINEAR_COUNT = 196
+AWQ_DECODER_LAYER_COUNT = 28
+AWQ_LINEAR_SUFFIXES = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
 
 
 def read_json(path):
@@ -112,9 +122,8 @@ def checkpoint_index(folder):
 def inspect_awq_modules(index):
     """Validate this model's packed ModelOpt AWQ module layout.
 
-    The original checkpoint has 196 decoder linears.  A second supported
-    layout adds a packed ``lm_head`` while keeping the embedding and visual
-    tower unquantized.
+    The full checkpoint has 196 decoder linears.  Mixed precision may keep
+    complete decoder blocks in FP16; a packed ``lm_head`` remains optional.
     """
     packed = {
         key[:-7] for key, (_, entry) in index.items()
@@ -124,16 +133,40 @@ def inspect_awq_modules(index):
         name for name in packed
         if name.startswith("model.language_model.layers.")
     }
-    allowed = backbone | ({"lm_head"} if "lm_head" in packed else set())
+    expected = {
+        f"model.language_model.layers.{layer}.{suffix}"
+        for layer in range(AWQ_DECODER_LAYER_COUNT)
+        for suffix in AWQ_LINEAR_SUFFIXES
+    }
+    allowed = expected | {"lm_head"}
     unexpected = sorted(packed - allowed)
-    if len(backbone) != AWQ_BACKBONE_LINEAR_COUNT or unexpected:
+    missing = expected - backbone
+    fp16_layers = []
+    partial_layers = []
+    for layer in range(AWQ_DECODER_LAYER_COUNT):
+        layer_expected = {
+            f"model.language_model.layers.{layer}.{suffix}"
+            for suffix in AWQ_LINEAR_SUFFIXES
+        }
+        layer_missing = layer_expected & missing
+        if layer_missing == layer_expected:
+            fp16_layers.append(layer)
+        elif layer_missing:
+            partial_layers.append({
+                "layer": layer,
+                "missing": sorted(layer_missing),
+            })
+    if unexpected or partial_layers:
         raise ValueError(
-            "Expected 196 packed decoder linears plus optional packed "
-            f"lm_head; backbone={len(backbone)}, unexpected={unexpected[:8]}"
+            "Expected seven packed linears per INT4 decoder block and complete "
+            "blocks for FP16 fallback; "
+            f"backbone={len(backbone)}, unexpected={unexpected[:8]}, "
+            f"partial_layers={partial_layers[:2]}"
         )
     return {
         "packed_modules": packed,
         "backbone_linears": len(backbone),
+        "fp16_backbone_layers": fp16_layers,
         "lm_head_int4": "lm_head" in packed,
         "total_packed_linears": len(packed),
     }

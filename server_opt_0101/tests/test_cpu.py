@@ -11,11 +11,12 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import (check_splits, inspect_awq_modules, load_config,
-                    prepare_manifests, read_json, read_manifest,
+                    AWQ_LINEAR_SUFFIXES, prepare_manifests, read_json, read_manifest,
                     safetensor_header)
 from requantize_awq_lm_head import (configure_image_token_range,
                                     diversify_repeated_questions,
                                     select_calibration_rows)
+from llm_layer_sensitivity import aggregate, recovery_row
 from torch_work import replace_named_submodule, unpack_awq_numpy
 from trt_vision_check import (classify_feature_metrics, feature_metrics,
                               profile_shapes)
@@ -47,8 +48,8 @@ class PackingTests(unittest.TestCase):
             }
 
         index = {
-            f"model.language_model.layers.{i}.proj.weight": item()
-            for i in range(196)
+            f"model.language_model.layers.{i}.{suffix}.weight": item()
+            for i in range(28) for suffix in AWQ_LINEAR_SUFFIXES
         }
         base = inspect_awq_modules(index)
         self.assertEqual(base["total_packed_linears"], 196)
@@ -65,10 +66,29 @@ class PackingTests(unittest.TestCase):
             }
 
         index = {
-            f"model.language_model.layers.{i}.proj.weight": item()
-            for i in range(196)
+            f"model.language_model.layers.{i}.{suffix}.weight": item()
+            for i in range(28) for suffix in AWQ_LINEAR_SUFFIXES
         }
         index["model.language_model.embed_tokens.weight"] = item()
+        with self.assertRaises(ValueError):
+            inspect_awq_modules(index)
+
+    def test_awq_layout_accepts_complete_fp16_blocks_only(self):
+        def item():
+            return Path("weights.safetensors"), {
+                "dtype": "U8", "shape": [1], "data_offsets": [0, 1]
+            }
+
+        index = {
+            f"model.language_model.layers.{i}.{suffix}.weight": item()
+            for i in range(28) for suffix in AWQ_LINEAR_SUFFIXES
+            if i not in (3, 17)
+        }
+        index["lm_head.weight"] = item()
+        layout = inspect_awq_modules(index)
+        self.assertEqual(layout["backbone_linears"], 182)
+        self.assertEqual(layout["fp16_backbone_layers"], [3, 17])
+        del index["model.language_model.layers.4.mlp.down_proj.weight"]
         with self.assertRaises(ValueError):
             inspect_awq_modules(index)
 
@@ -198,6 +218,25 @@ class FileTests(unittest.TestCase):
 
 
 class MetricTests(unittest.TestCase):
+    def test_layer_recovery_metrics_are_token_weighted(self):
+        rows = [
+            {"tokens": 1, "teacher_top1_agreement": 1.0,
+             "teacher_kl": 0.1, "teacher_token_nll_reference": 0.2,
+             "teacher_token_nll_candidate": 0.3},
+            {"tokens": 3, "teacher_top1_agreement": 0.0,
+             "teacher_kl": 0.5, "teacher_token_nll_reference": 0.6,
+             "teacher_token_nll_candidate": 0.7},
+        ]
+        metrics = aggregate(rows)
+        self.assertAlmostEqual(metrics["teacher_top1_agreement"], 0.25)
+        self.assertAlmostEqual(metrics["teacher_kl"], 0.4)
+        baseline = dict(metrics)
+        baseline["teacher_kl"] = 0.6
+        baseline["teacher_token_nll_candidate"] = 0.8
+        row = recovery_row("3", "decoder_block", metrics, baseline, 10.0)
+        self.assertAlmostEqual(row["kl_reduction"], 0.2)
+        self.assertAlmostEqual(row["kl_reduction_per_extra_mib"], 0.02)
+
     def test_identical(self):
         values = np.array([[1, 2, 3], [-1, 3, 1]], dtype=np.float16)
         result = feature_metrics(values, values)

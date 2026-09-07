@@ -9,7 +9,8 @@ import random
 from collections import Counter
 from pathlib import Path
 
-from common import (CALIBRATION_IMAGE_PROMPTS, checkpoint_index,
+from common import (AWQ_DECODER_LAYER_COUNT, AWQ_LINEAR_SUFFIXES,
+                    CALIBRATION_IMAGE_PROMPTS, checkpoint_index,
                     inspect_awq_modules, read_json, read_manifest, versions,
                     write_json)
 
@@ -151,6 +152,10 @@ def main():
     parser.add_argument("--max-image-tokens", type=int, default=64)
     parser.add_argument("--keep-image-questions", action="store_true",
                         help="Do not diversify repeated unlabeled image questions")
+    parser.add_argument(
+        "--fp16-layer", type=int, action="append", default=[],
+        help="Keep one complete decoder block in FP16; repeat for more layers",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -168,6 +173,13 @@ def main():
         raise ValueError(
             "Expected 1 <= --min-image-tokens <= --max-image-tokens"
         )
+    fp16_layers = sorted(set(args.fp16_layer))
+    invalid_layers = [
+        layer for layer in fp16_layers
+        if not 0 <= layer < AWQ_DECODER_LAYER_COUNT
+    ]
+    if invalid_layers:
+        raise ValueError(f"Invalid --fp16-layer values: {invalid_layers}")
 
     image_rows = read_manifest(args.calib, require_image=True)
 
@@ -215,6 +227,13 @@ def main():
             f"Unexpected Edge-LLM/ModelOpt INT4 AWQ config: {algorithm!r}"
         )
     algorithm["alpha_step"] = args.alpha_step
+    for layer in fp16_layers:
+        # This rule is part of the backbone config and therefore wins over the
+        # stock AWQ wildcard for every Linear quantizer in the selected block.
+        custom_cfg["quant_cfg"].append({
+            "quantizer_name": f"*model.language_model.layers.{layer}.*",
+            "enable": False,
+        })
 
     original_loader = quant_module._multimodal_calib_dataloader
     batch_metadata = {}
@@ -264,7 +283,7 @@ def main():
     print(
         f"Full-model AWQ calibration: alpha_step={args.alpha_step}, "
         f"images={image_count}, text={text_count}, "
-        f"assistant_answers={answer_count}"
+        f"assistant_answers={answer_count}, fp16_layers={fp16_layers}"
     )
 
     config_module._BACKBONE_CFG_MAP["int4_awq"] = custom_cfg
@@ -287,7 +306,14 @@ def main():
 
     index = checkpoint_index(output)
     layout = inspect_awq_modules(index)
-    if not layout["lm_head_int4"] or layout["total_packed_linears"] != 197:
+    expected_packed = (
+        AWQ_DECODER_LAYER_COUNT * len(AWQ_LINEAR_SUFFIXES)
+        - len(fp16_layers) * len(AWQ_LINEAR_SUFFIXES)
+        + 1
+    )
+    if (not layout["lm_head_int4"]
+            or layout["total_packed_linears"] != expected_packed
+            or layout["fp16_backbone_layers"] != fp16_layers):
         raise RuntimeError(f"LM-head INT4 export validation failed: {layout}")
     quant = read_json(output / "hf_quant_config.json")["quantization"]
     if quant.get("quant_algo") != "W4A16_AWQ" or quant.get("group_size") != 128:
@@ -306,6 +332,8 @@ def main():
         "unique_questions": len({row["question"] for row in rows}),
         "diversified_repeated_image_questions": diversified,
         "awq_alpha_step": args.alpha_step,
+        "fp16_backbone_layers": fp16_layers,
+        "expected_packed_linears": expected_packed,
         "max_sequence_tokens": args.max_seq_len,
         "min_image_tokens": args.min_image_tokens,
         "max_image_tokens": args.max_image_tokens,
@@ -319,7 +347,10 @@ def main():
         ),
     }
     write_json(output / "lm_head_int4_report.json", report)
-    print(f"Validated 196 backbone AWQ linears + INT4 lm_head: {output}")
+    print(
+        f"Validated mixed backbone ({layout['backbone_linears']} INT4 linears, "
+        f"FP16 layers={fp16_layers}) + INT4 lm_head: {output}"
+    )
 
 
 if __name__ == "__main__":

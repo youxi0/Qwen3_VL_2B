@@ -191,6 +191,42 @@ bash server_opt_0101/run_server.sh run \
 实际节省量以新 `memory_budget.json` 为准。重新校准意味着 decoder AWQ
 尺度也会重算，必须重新查看 AWQ 与组合端到端指标，不能沿用旧报告。
 
+## 5.2 LLM 逐层回退与混合精度
+
+先用校准集中的少量图片做单层消融，不要用最终验证集选层。脚本保持其他层和
+LM head 为 INT4，每次仅把一个完整 decoder block 临时恢复为 FP16，再测最终
+logits；同时单独测试 FP16 LM head：
+
+```bash
+python server_opt_0101/llm_layer_sensitivity.py \
+  --root . \
+  --config server_opt_0101/config.lmhead-int4-residual-a07-a005-diverse.json \
+  --probe outputs/manifests-formal-diverse-v2/calib.jsonl \
+  --max-samples 8 \
+  --out outputs/llm-layer-sensitivity-a005-v1.json
+```
+
+报告按 `kl_reduction_per_extra_mib` 排序。正数表示回退该层能改善精度；负数表示
+在这组样本上没有收益。Qwen3-VL-2B 的完整 decoder block 从 INT4 回退 FP16
+约增加 70.5 MiB。各层独立消融结果不能简单相加，先选 2～4 个收益最高且稳定
+为正的层，再重新量化，例如：
+
+```bash
+python server_opt_0101/requantize_awq_lm_head.py \
+  --model-dir models/Qwen3-VL-2B-Instruct \
+  --calib outputs/manifests-formal-diverse-v2/calib.jsonl \
+  --alpha-step 0.05 \
+  --num-samples 128 \
+  --fp16-layer 这里填第一层编号 \
+  --fp16-layer 这里填第二层编号 \
+  --out outputs/Qwen3-VL-2B-MIXED-AWQ-v0101
+```
+
+混合 checkpoint 仍保持 LM head INT4。导出命令不变；更新配置中的 `awq` 与
+`awq_onnx` 后，必须在原来未参与选层的 32 张验证集上重新跑完整指标和内存。
+不要因为 477 MiB 是逻辑估算余量就回退 6 层用满；应给 Jetson Engine 重排、
+CUDA 和运行峰值保留安全空间。
+
 ## 6. 输出与内存判断
 
 ```text
