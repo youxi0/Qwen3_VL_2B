@@ -122,8 +122,9 @@ def checkpoint_index(folder):
 def inspect_awq_modules(index):
     """Validate this model's packed ModelOpt AWQ module layout.
 
-    The full checkpoint has 196 decoder linears.  Mixed precision may keep
-    complete decoder blocks in FP16; a packed ``lm_head`` remains optional.
+    The full checkpoint has 196 decoder linears. Mixed precision may keep
+    complete blocks or selected Linear modules in FP16; a packed ``lm_head``
+    remains optional.
     """
     packed = {
         key[:-7] for key, (_, entry) in index.items()
@@ -152,21 +153,25 @@ def inspect_awq_modules(index):
         if layer_missing == layer_expected:
             fp16_layers.append(layer)
         elif layer_missing:
-            partial_layers.append({
-                "layer": layer,
-                "missing": sorted(layer_missing),
-            })
-    if unexpected or partial_layers:
+            partial_layers.append(layer)
+    invalid_fp16 = []
+    for name in sorted(missing):
+        weight = index.get(name + ".weight")
+        if weight is None or weight[1]["dtype"] not in {"F16", "BF16", "F32"}:
+            invalid_fp16.append(name)
+    if unexpected or invalid_fp16:
         raise ValueError(
-            "Expected seven packed linears per INT4 decoder block and complete "
-            "blocks for FP16 fallback; "
+            "Expected every decoder Linear to be packed INT4 or explicitly "
+            "stored as a floating-point fallback; "
             f"backbone={len(backbone)}, unexpected={unexpected[:8]}, "
-            f"partial_layers={partial_layers[:2]}"
+            f"invalid_fp16={invalid_fp16[:8]}"
         )
     return {
         "packed_modules": packed,
         "backbone_linears": len(backbone),
         "fp16_backbone_layers": fp16_layers,
+        "partial_fp16_backbone_layers": partial_layers,
+        "fp16_backbone_modules": sorted(missing),
         "lm_head_int4": "lm_head" in packed,
         "total_packed_linears": len(packed),
     }

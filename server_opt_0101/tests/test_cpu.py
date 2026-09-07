@@ -73,10 +73,10 @@ class PackingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             inspect_awq_modules(index)
 
-    def test_awq_layout_accepts_complete_fp16_blocks_only(self):
-        def item():
+    def test_awq_layout_accepts_fp16_blocks_and_modules(self):
+        def item(dtype="U8"):
             return Path("weights.safetensors"), {
-                "dtype": "U8", "shape": [1], "data_offsets": [0, 1]
+                "dtype": dtype, "shape": [1], "data_offsets": [0, 1]
             }
 
         index = {
@@ -84,13 +84,18 @@ class PackingTests(unittest.TestCase):
             for i in range(28) for suffix in AWQ_LINEAR_SUFFIXES
             if i not in (3, 17)
         }
+        for i in (3, 17):
+            for suffix in AWQ_LINEAR_SUFFIXES:
+                index[f"model.language_model.layers.{i}.{suffix}.weight"] = item("F16")
         index["lm_head.weight"] = item()
         layout = inspect_awq_modules(index)
         self.assertEqual(layout["backbone_linears"], 182)
         self.assertEqual(layout["fp16_backbone_layers"], [3, 17])
-        del index["model.language_model.layers.4.mlp.down_proj.weight"]
-        with self.assertRaises(ValueError):
-            inspect_awq_modules(index)
+        index["model.language_model.layers.4.mlp.down_proj.weight"] = item("F16")
+        partial = inspect_awq_modules(index)
+        self.assertEqual(partial["partial_fp16_backbone_layers"], [4])
+        self.assertIn("model.language_model.layers.4.mlp.down_proj",
+                      partial["fp16_backbone_modules"])
 
     def test_replace_root_and_nested_quantized_modules(self):
         class Node:

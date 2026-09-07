@@ -18,6 +18,15 @@ METRIC_KEYS = (
     "teacher_token_nll_candidate",
 )
 
+MODULE_GROUPS = {
+    "attention_qkv": (
+        "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"
+    ),
+    "attention_o": ("self_attn.o_proj",),
+    "mlp_gate_up": ("mlp.gate_proj", "mlp.up_proj"),
+    "mlp_down": ("mlp.down_proj",),
+}
+
 
 def aggregate(rows):
     total = sum(row["tokens"] for row in rows)
@@ -90,6 +99,11 @@ def main():
     parser.add_argument("--layers", type=int, nargs="*",
                         help="Optional subset; default scans every INT4 block")
     parser.add_argument(
+        "--module-layers", type=int, nargs="*", default=[],
+        help="Scan qkv/o/gate+up/down groups inside these decoder layers",
+    )
+    parser.add_argument("--skip-block-scan", action="store_true")
+    parser.add_argument(
         "--joint-layers", type=int, nargs="*", default=[],
         help="Also evaluate these FP16 blocks together in one forward sweep",
     )
@@ -115,7 +129,7 @@ def main():
     original_index = checkpoint_index(cfg["original"])
     layout = inspect_awq_modules(awq_index)
     already_fp16 = set(layout["fp16_backbone_layers"])
-    requested = [] if args.joint_only else (
+    requested = [] if (args.joint_only or args.skip_block_scan) else (
         list(range(AWQ_DECODER_LAYER_COUNT))
         if args.layers is None else sorted(set(args.layers))
     )
@@ -124,6 +138,8 @@ def main():
     invalid = [layer for layer in requested
                if not 0 <= layer < AWQ_DECODER_LAYER_COUNT]
     invalid += [layer for layer in args.joint_layers
+                if not 0 <= layer < AWQ_DECODER_LAYER_COUNT]
+    invalid += [layer for layer in args.module_layers
                 if not 0 <= layer < AWQ_DECODER_LAYER_COUNT]
     if invalid:
         raise ValueError(f"Invalid layer indices: {invalid}")
@@ -161,6 +177,7 @@ def main():
         "baseline": baseline,
         "already_fp16_layers": sorted(already_fp16),
         "results": [],
+        "module_results": [],
         "selection_warning": (
             "Independent one-at-a-time recoveries are not additive. Select on "
             "this probe set, then validate the resulting mixed checkpoint on "
@@ -190,6 +207,41 @@ def main():
                              extra)
             )
             write_json(output, report)
+
+        already_fp16_modules = set(layout["fp16_backbone_modules"])
+        for layer in sorted(set(args.module_layers)):
+            for group, suffixes in MODULE_GROUPS.items():
+                names = [
+                    f"model.language_model.layers.{layer}.{suffix}"
+                    for suffix in suffixes
+                ]
+                names = [name for name in names
+                         if name not in already_fp16_modules]
+                if not names:
+                    continue
+                saved = {}
+                try:
+                    for name in names:
+                        saved[name] = candidate.get_submodule(name)
+                        replace_named_submodule(candidate, name,
+                                                base.get_submodule(name))
+                    metrics = score_logits_only(
+                        candidate, processor, references, cfg,
+                        f"FP16 {layer}:{group}",
+                    )
+                finally:
+                    for name, module in saved.items():
+                        replace_named_submodule(candidate, name, module)
+                extra = sum(
+                    tensor_bytes(original_index, name)
+                    - tensor_bytes(awq_index, name)
+                    for name in names
+                ) / 2**20
+                report["module_results"].append(
+                    recovery_row(f"{layer}:{group}", "module_group",
+                                 metrics, baseline, extra)
+                )
+                write_json(output, report)
 
         joint_layers = sorted(set(args.joint_layers) - already_fp16)
         if joint_layers:
@@ -246,6 +298,11 @@ def main():
         report["results_by_kl_reduction"] = sorted(
             report["results"],
             key=lambda row: row["kl_reduction"],
+            reverse=True,
+        )
+        report["module_results_by_kl_per_mib"] = sorted(
+            report["module_results"],
+            key=lambda row: row["kl_reduction_per_extra_mib"],
             reverse=True,
         )
         report["status"] = "complete"

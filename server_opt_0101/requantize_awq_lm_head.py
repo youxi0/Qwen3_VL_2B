@@ -67,6 +67,23 @@ def select_calibration_rows(image_rows, text_rows, total, text_fraction, seed):
     return selected
 
 
+def parse_fp16_module(spec):
+    """Parse ``LAYER:SUFFIX`` into the exact Qwen decoder module name."""
+    try:
+        layer_text, suffix = spec.split(":", 1)
+        layer = int(layer_text)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Invalid --fp16-module {spec!r}; use e.g. 3:mlp.down_proj"
+        ) from exc
+    if not 0 <= layer < AWQ_DECODER_LAYER_COUNT or suffix not in AWQ_LINEAR_SUFFIXES:
+        raise ValueError(
+            f"Invalid --fp16-module {spec!r}; suffix must be one of "
+            f"{list(AWQ_LINEAR_SUFFIXES)}"
+        )
+    return f"model.language_model.layers.{layer}.{suffix}"
+
+
 def build_calibration_batches(processor, rows, max_seq_len):
     """Materialize full user/assistant conversations for ModelOpt AWQ."""
     import torch
@@ -156,6 +173,10 @@ def main():
         "--fp16-layer", type=int, action="append", default=[],
         help="Keep one complete decoder block in FP16; repeat for more layers",
     )
+    parser.add_argument(
+        "--fp16-module", action="append", default=[],
+        help="Keep LAYER:SUFFIX in FP16, e.g. 3:mlp.down_proj; repeat as needed",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -180,6 +201,20 @@ def main():
     ]
     if invalid_layers:
         raise ValueError(f"Invalid --fp16-layer values: {invalid_layers}")
+    fp16_modules = {
+        f"model.language_model.layers.{layer}.{suffix}"
+        for layer in fp16_layers for suffix in AWQ_LINEAR_SUFFIXES
+    }
+    fp16_modules.update(parse_fp16_module(spec) for spec in args.fp16_module)
+    fp16_modules = sorted(fp16_modules)
+    fp16_module_set = set(fp16_modules)
+    fp16_layers = [
+        layer for layer in range(AWQ_DECODER_LAYER_COUNT)
+        if all(
+            f"model.language_model.layers.{layer}.{suffix}" in fp16_module_set
+            for suffix in AWQ_LINEAR_SUFFIXES
+        )
+    ]
 
     image_rows = read_manifest(args.calib, require_image=True)
 
@@ -227,11 +262,11 @@ def main():
             f"Unexpected Edge-LLM/ModelOpt INT4 AWQ config: {algorithm!r}"
         )
     algorithm["alpha_step"] = args.alpha_step
-    for layer in fp16_layers:
-        # This rule is part of the backbone config and therefore wins over the
-        # stock AWQ wildcard for every Linear quantizer in the selected block.
+    for module_name in fp16_modules:
+        # These rules are part of the backbone config and therefore win over
+        # the stock AWQ wildcard for the selected Linear quantizers.
         custom_cfg["quant_cfg"].append({
-            "quantizer_name": f"*model.language_model.layers.{layer}.*",
+            "quantizer_name": f"*{module_name}.*",
             "enable": False,
         })
 
@@ -283,7 +318,7 @@ def main():
     print(
         f"Full-model AWQ calibration: alpha_step={args.alpha_step}, "
         f"images={image_count}, text={text_count}, "
-        f"assistant_answers={answer_count}, fp16_layers={fp16_layers}"
+        f"assistant_answers={answer_count}, fp16_modules={fp16_modules}"
     )
 
     config_module._BACKBONE_CFG_MAP["int4_awq"] = custom_cfg
@@ -307,13 +342,11 @@ def main():
     index = checkpoint_index(output)
     layout = inspect_awq_modules(index)
     expected_packed = (
-        AWQ_DECODER_LAYER_COUNT * len(AWQ_LINEAR_SUFFIXES)
-        - len(fp16_layers) * len(AWQ_LINEAR_SUFFIXES)
-        + 1
+        AWQ_DECODER_LAYER_COUNT * len(AWQ_LINEAR_SUFFIXES) - len(fp16_modules) + 1
     )
     if (not layout["lm_head_int4"]
             or layout["total_packed_linears"] != expected_packed
-            or layout["fp16_backbone_layers"] != fp16_layers):
+            or layout["fp16_backbone_modules"] != fp16_modules):
         raise RuntimeError(f"LM-head INT4 export validation failed: {layout}")
     quant = read_json(output / "hf_quant_config.json")["quantization"]
     if quant.get("quant_algo") != "W4A16_AWQ" or quant.get("group_size") != 128:
@@ -333,6 +366,7 @@ def main():
         "diversified_repeated_image_questions": diversified,
         "awq_alpha_step": args.alpha_step,
         "fp16_backbone_layers": fp16_layers,
+        "fp16_backbone_modules": fp16_modules,
         "expected_packed_linears": expected_packed,
         "max_sequence_tokens": args.max_seq_len,
         "min_image_tokens": args.min_image_tokens,
@@ -349,7 +383,7 @@ def main():
     write_json(output / "lm_head_int4_report.json", report)
     print(
         f"Validated mixed backbone ({layout['backbone_linears']} INT4 linears, "
-        f"FP16 layers={fp16_layers}) + INT4 lm_head: {output}"
+        f"FP16 modules={fp16_modules}) + INT4 lm_head: {output}"
     )
 
 
