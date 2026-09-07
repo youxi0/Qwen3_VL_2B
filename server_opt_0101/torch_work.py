@@ -7,15 +7,8 @@ import json
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from common import checkpoint_index, read_json, write_json
-
-
-VISION_RECIPE_EXPECTED = {
-    "blocks": 96,
-    "conservative": 100,
-    "residual_fp16": 52,
-    "all_linears": 104,
-}
+from common import (VISION_RECIPE_EXPECTED, checkpoint_index, read_json,
+                    write_json)
 
 
 def vision_linear_is_target(name, recipe):

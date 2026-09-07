@@ -91,6 +91,17 @@ class FileTests(unittest.TestCase):
             self.assertEqual(cfg["calibration_samples"], 256)
             self.assertLessEqual(cfg["max_input_tokens"] + cfg["max_new_tokens"], cfg["kv_cache_capacity"])
 
+    def test_residual_fp16_recipe_passes_config_validation(self):
+        source = Path(__file__).resolve().parents[1] / "config.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            data = read_json(source)
+            data["vision_recipe"] = "residual_fp16"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(
+                load_config(path, temporary)["vision_recipe"],
+                "residual_fp16")
+
 
 class MetricTests(unittest.TestCase):
     def test_identical(self):

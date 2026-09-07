@@ -14,6 +14,12 @@ EXPECTED = {
     "transformers": "5.14.1", "nvidia-modelopt": "0.45.0",
     "onnx": "1.19.0", "safetensors": "0.8.0",
 }
+VISION_RECIPE_EXPECTED = {
+    "blocks": 96,
+    "conservative": 100,
+    "residual_fp16": 52,
+    "all_linears": 104,
+}
 
 
 def read_json(path):
@@ -40,8 +46,10 @@ def load_config(path, root):
         raise ValueError("KV capacity must cover prompt + generated tokens")
     if not 0 <= cfg["smoothquant_alpha"] <= 1:
         raise ValueError("smoothquant_alpha must be in [0,1]")
-    if cfg["vision_recipe"] not in ("blocks", "conservative", "all_linears"):
-        raise ValueError("Unknown vision_recipe")
+    if cfg["vision_recipe"] not in VISION_RECIPE_EXPECTED:
+        raise ValueError(
+            f"Unknown vision_recipe {cfg['vision_recipe']!r}; choose from "
+            f"{sorted(VISION_RECIPE_EXPECTED)}")
     return cfg
 
 
