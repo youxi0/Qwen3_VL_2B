@@ -35,6 +35,17 @@ def feature_metrics(reference, actual):
             "max_abs_error": float(np.abs(value-ref).max())}
 
 
+def classify_feature_metrics(matching, versus_original, label, cosine_min,
+                             l2_max, quant_cosine_min):
+    """Keep engine fidelity separate from the model's quantization gate."""
+    matching_pass = (matching["mean_token_cosine"] >= cosine_min and
+                     matching["relative_l2"] <= l2_max)
+    quantization_pass = (label != "int8" or
+                         versus_original["mean_token_cosine"] >=
+                         quant_cosine_min)
+    return bool(matching_pass), bool(quantization_pass)
+
+
 def build_engine(trt, logger, onnx_path, destination, cfg, workspace_mib):
     builder = trt.Builder(logger)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
@@ -132,11 +143,15 @@ def check_engine(trt, torch, logger, path, cases, label, repeat, cosine_min, l2_
             for name in sorted(OUTPUT_NAMES):
                 metrics = feature_metrics(gold[name], outputs[name])
                 vs_original = feature_metrics(original[name], outputs[name])
-                passed = metrics["mean_token_cosine"] >= cosine_min and metrics["relative_l2"] <= l2_max
-                if label == "int8":
-                    passed &= vs_original["mean_token_cosine"] >= quant_cosine_min
+                matching_pass, quantization_pass = classify_feature_metrics(
+                    metrics, vs_original, label, cosine_min, l2_max,
+                    quant_cosine_min)
                 rows.append({"case": case.name, "output": name, "versus_matching_pytorch": metrics,
-                             "versus_original_fp16": vs_original, "engine_only_latency_ms": ms, "pass": bool(passed)})
+                             "versus_original_fp16": vs_original,
+                             "engine_only_latency_ms": ms,
+                             "matching_pytorch_pass": matching_pass,
+                             "candidate_quantization_pass": quantization_pass,
+                             "pass": matching_pass})
         np.savez(report_dir / f"{label}_{case.name}_outputs.npz", **outputs)
         print(f"[{label}] {case.name}: {ms:.3f} ms (server, excludes preprocessing/transfers)", flush=True)
     inspector = engine.create_engine_inspector()
@@ -163,9 +178,14 @@ def check_engine(trt, torch, logger, path, cases, label, repeat, cosine_min, l2_
 
     gather(layer_info)
     int8_formats = sorted({s for s in formats if "int8" in s.lower() or "i8" in s.lower()})
+    engine_fidelity_pass = all(row["matching_pytorch_pass"] for row in rows)
+    quantization_gate_pass = all(
+        row["candidate_quantization_pass"] for row in rows)
     result = {"precision": label, "engine_mib": path.stat().st_size / 2**20,
               "context_device_memory_mib": engine.device_memory_size / 2**20,
-              "numerical_pass": all(row["pass"] for row in rows), "samples": rows,
+              "engine_fidelity_pass": engine_fidelity_pass,
+              "quantization_gate_pass": quantization_gate_pass,
+              "numerical_pass": engine_fidelity_pass, "samples": rows,
               "int8_tensor_formats_observed": int8_formats,
               "int8_execution_evidence_found": bool(int8_formats),
               "note": "Inspector tensor formats are diagnostic; review per-layer tactics for INT8 GEMM coverage. These are RTX server engine numbers, not Jetson measurements."}
@@ -213,10 +233,15 @@ def main():
         results[label] = check_engine(trt, torch, logger, engine_path, cases, label, args.repeat,
                                      args.cosine_min, args.relative_l2_max,
                                      cfg["gates"]["vision_mean_token_cosine_min"], output)
-    numerical_pass = all(r["numerical_pass"] for r in results.values())
-    passed = numerical_pass and results["int8"]["int8_execution_evidence_found"]
+    engine_fidelity_pass = all(
+        r["engine_fidelity_pass"] for r in results.values())
+    quantization_gate_pass = results["int8"]["quantization_gate_pass"]
+    passed = (engine_fidelity_pass and
+              results["int8"]["int8_execution_evidence_found"])
     report = {"server_trt_vision_verified": passed, "tensorrt": trt.__version__,
-              "numerical_pass": numerical_pass,
+              "engine_fidelity_pass": engine_fidelity_pass,
+              "candidate_quantization_gate_pass": quantization_gate_pass,
+              "numerical_pass": engine_fidelity_pass,
               "torch": torch.__version__, "gpu": torch.cuda.get_device_name(0),
               "plugin_lib": str(args.plugin_lib.resolve()), "workspace_limit_mib": args.workspace_mib,
               "cosine_min": args.cosine_min, "relative_l2_max": args.relative_l2_max,
@@ -227,9 +252,13 @@ def main():
     status = read_json(run_dir / "reports" / "status.json")
     status["server_trt_vision_verified"] = passed
     status["server_trt_int8_tensor_evidence"] = results["int8"]["int8_execution_evidence_found"]
+    status["server_trt_vision_engine_fidelity"] = engine_fidelity_pass
+    status["server_trt_vision_candidate_quantization_gate"] = quantization_gate_pass
     for relative in ("reports/status.json", "jetson_onnx_candidate/STATUS.json", "jetson_onnx_candidate/reports/status.json"):
         write_json(run_dir / relative, status)
-    print(f"Server vision numerical verification: {'PASS' if passed else 'FAIL'}; Jetson fit remains unverified.")
+    print(f"Server Vision engine fidelity: {'PASS' if passed else 'FAIL'}; "
+          f"candidate quantization gate: {'PASS' if quantization_gate_pass else 'FAIL'}; "
+          "Jetson fit remains unverified.")
     if not results["int8"]["int8_execution_evidence_found"]:
         print("No INT8 tensor formats found in engine inspector. Check the detailed inspector file before accepting the engine.")
     return 0 if passed else 2

@@ -102,7 +102,7 @@ python server_opt_0101/trt_vision_check.py \
   --workspace-mib 256
 ```
 
-它分别构建原 FP16 Vision 和新 INT8 Vision，只跑保存的真实视觉输入，比较四个输出：FP16 Engine 对原始 PyTorch、INT8 Engine 对 fake-quant PyTorch，并检查 INT8 Engine 对原始 FP16 的误差。保存每层 inspector 信息、输出、Engine 大小、context memory 和服务器推理耗时。默认匹配参考要求平均余弦 ≥0.999 且 relative L2 ≤0.03；INT8 对原 FP16 还须满足配置中的 0.99 门槛。这些是可配置的实验门槛，不是官方精度保证。
+它分别构建原 FP16 Vision 和新 INT8 Vision，只跑保存的真实视觉输入，比较四个输出：FP16 Engine 对原始 PyTorch、INT8 Engine 对 fake-quant PyTorch，并另外检查 INT8 Engine 对原始 FP16 的量化误差。保存每层 inspector 信息、输出、Engine 大小、context memory 和服务器推理耗时。Engine 匹配参考要求平均余弦 ≥0.999 且 relative L2 ≤0.03；INT8 对原 FP16 的 0.99 是独立的候选精度门槛，不会再把一个忠实复现 fake-quant 的 TensorRT Engine 错报为构建验证失败。这些是可配置的实验门槛，不是官方精度保证。
 
 `server_engines/` 不会进入可迁移包。**RTX 4090 构建的 Engine 不能直接作为 Jetson Engine 使用。** 未来需在目标 Jetson 上构建，或使用厂商明确支持且匹配平台的交叉构建方案。TensorRT 的输入与执行接口见 [TensorRT 10.x Python 文档](https://docs.nvidia.com/deeplearning/tensorrt/10.x.x/inference-library/python-api-docs.html)。
 

@@ -12,7 +12,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import check_splits, load_config, prepare_manifests, read_json, read_manifest, safetensor_header
 from torch_work import unpack_awq_numpy
-from trt_vision_check import feature_metrics, profile_shapes
+from trt_vision_check import (classify_feature_metrics, feature_metrics,
+                              profile_shapes)
 
 
 class PackingTests(unittest.TestCase):
@@ -122,6 +123,14 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(shapes["fast_pos_embed_idx"], (4, 256))
         self.assertEqual(shapes["cu_seqlens"], (2,))
         self.assertEqual(shapes["rotary_pos_emb"], (256, 32))
+
+    def test_engine_fidelity_is_independent_of_quantization_gate(self):
+        matching = {"mean_token_cosine": 0.9999, "relative_l2": 0.01}
+        original = {"mean_token_cosine": 0.95, "relative_l2": 0.30}
+        fidelity, quantization = classify_feature_metrics(
+            matching, original, "int8", 0.999, 0.03, 0.99)
+        self.assertTrue(fidelity)
+        self.assertFalse(quantization)
 
 
 if __name__ == "__main__":
