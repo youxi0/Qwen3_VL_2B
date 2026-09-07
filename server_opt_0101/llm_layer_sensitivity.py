@@ -89,6 +89,12 @@ def main():
     parser.add_argument("--max-samples", type=int, default=8)
     parser.add_argument("--layers", type=int, nargs="*",
                         help="Optional subset; default scans every INT4 block")
+    parser.add_argument(
+        "--joint-layers", type=int, nargs="*", default=[],
+        help="Also evaluate these FP16 blocks together in one forward sweep",
+    )
+    parser.add_argument("--joint-only", action="store_true",
+                        help="Skip individual scans and run only --joint-layers")
     parser.add_argument("--skip-lm-head", action="store_true")
     args = parser.parse_args()
 
@@ -109,12 +115,16 @@ def main():
     original_index = checkpoint_index(cfg["original"])
     layout = inspect_awq_modules(awq_index)
     already_fp16 = set(layout["fp16_backbone_layers"])
-    requested = (
+    requested = [] if args.joint_only else (
         list(range(AWQ_DECODER_LAYER_COUNT))
         if args.layers is None else sorted(set(args.layers))
     )
+    if args.joint_only and not args.joint_layers:
+        raise ValueError("--joint-only requires --joint-layers")
     invalid = [layer for layer in requested
                if not 0 <= layer < AWQ_DECODER_LAYER_COUNT]
+    invalid += [layer for layer in args.joint_layers
+                if not 0 <= layer < AWQ_DECODER_LAYER_COUNT]
     if invalid:
         raise ValueError(f"Invalid layer indices: {invalid}")
     layers = [layer for layer in requested if layer not in already_fp16]
@@ -178,6 +188,35 @@ def main():
             report["results"].append(
                 recovery_row(str(layer), "decoder_block", metrics, baseline,
                              extra)
+            )
+            write_json(output, report)
+
+        joint_layers = sorted(set(args.joint_layers) - already_fp16)
+        if joint_layers:
+            saved = {}
+            try:
+                for layer in joint_layers:
+                    name = f"model.language_model.layers.{layer}"
+                    saved[name] = candidate.get_submodule(name)
+                    replace_named_submodule(candidate, name,
+                                            base.get_submodule(name))
+                metrics = score_logits_only(
+                    candidate, processor, references, cfg,
+                    "joint FP16 layers " + ",".join(map(str, joint_layers)),
+                )
+            finally:
+                for name, module in saved.items():
+                    replace_named_submodule(candidate, name, module)
+            extra = sum(
+                tensor_bytes(original_index,
+                             f"model.language_model.layers.{layer}")
+                - tensor_bytes(awq_index,
+                               f"model.language_model.layers.{layer}")
+                for layer in joint_layers
+            ) / 2**20
+            report["joint_result"] = recovery_row(
+                ",".join(map(str, joint_layers)), "joint_decoder_blocks",
+                metrics, baseline, extra,
             )
             write_json(output, report)
 
