@@ -1,0 +1,26 @@
+{
+  "original": "models/Qwen3-VL-2B-Instruct",
+  "awq": "outputs/Qwen3-VL-2B-OLD-AWQ-INT4-LMHEAD-v0101",
+  "awq_onnx": "outputs/Qwen3-VL-2B-OLD-AWQ-INT4-LMHEAD-ONNX-v0101",
+  "images": "dataset",
+  "min_image_tokens": 16,
+  "max_image_tokens": 64,
+  "max_input_tokens": 256,
+  "max_new_tokens": 32,
+  "kv_cache_capacity": 384,
+  "calibration_samples": 256,
+  "evaluation_samples": 32,
+  "smoothquant_alpha": 0.7,
+  "vision_recipe": "residual_fp16",
+  "seed": 42,
+  "jetson_total_gib": 3.6,
+  "system_and_cuda_reserve_mib": 900,
+  "activation_and_workspace_reserve_mib": 256,
+  "gates": {
+    "awq_teacher_top1_min": 0.7,
+    "awq_teacher_kl_max": 0.3,
+    "vision_mean_token_cosine_min": 0.99,
+    "combined_teacher_top1_min": 0.65,
+    "combined_teacher_kl_max": 0.4
+  }
+}
