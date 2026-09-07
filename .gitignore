@@ -1,2 +1,7 @@
 dataset/
 models/
+# Generated model weights and runtime engines
+*.safetensors
+*.onnx.data
+*.engine
+*.plan
