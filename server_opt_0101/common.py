@@ -14,6 +14,21 @@ EXPECTED = {
     "transformers": "5.14.1", "nvidia-modelopt": "0.45.0",
     "onnx": "1.19.0", "safetensors": "0.8.0",
 }
+
+
+# Rotate calibration prompts so AWQ observes more than one hidden-state
+# distribution.  Evaluation deliberately keeps one fixed prompt so historical
+# runs remain directly comparable.
+CALIBRATION_IMAGE_PROMPTS = (
+    "请简洁描述图片的整体场景、主要物体及其位置关系。",
+    "识别图中的主要对象，并说明它们的数量、颜色和显著特征。",
+    "图中正在发生什么？请按从重要到次要的顺序说明。",
+    "读取图片中清晰可见的文字、数字或标志；看不清的内容不要猜测。",
+    "请关注图片的局部细节、背景以及容易忽略的小物体。",
+    "判断图中是否存在异常、损坏、危险或不符合常理的地方，并说明依据。",
+    "概括图片内容，然后给出一个能区分该场景的关键细节。",
+    "Describe the scene, the main objects, and their spatial relationships concisely.",
+)
 VISION_RECIPE_EXPECTED = {
     "blocks": 96,
     "conservative": 100,
@@ -208,10 +223,22 @@ def prepare_manifests(cfg, output, smoke=False):
         raise ValueError(f"Need {nc + ne} distinct images ({nc} calibration + {ne} evaluation); found {len(images)}. Use --smoke only to test the pipeline.")
     output.mkdir(parents=True)
     for name, subset in (("calib", images[:nc]), ("eval", images[nc:nc+ne])):
-        rows = [{"id": f"{name}_{i:05d}", "image": str(image), "question": "描述这张图片中可见的内容。"} for i, image in enumerate(subset)]
+        rows = []
+        for i, image in enumerate(subset):
+            question = (
+                CALIBRATION_IMAGE_PROMPTS[i % len(CALIBRATION_IMAGE_PROMPTS)]
+                if name == "calib"
+                else "描述这张图片中可见的内容。"
+            )
+            rows.append({
+                "id": f"{name}_{i:05d}",
+                "image": str(image),
+                "question": question,
+            })
         (output / f"{name}.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
     write_json(output / "manifest_info.json", {"smoke_only": smoke, "calibration": nc, "evaluation": ne,
                "seed": cfg["seed"], "ground_truth_answers": False, "images_scanned": scanned,
+               "calibration_prompt_variants": len(CALIBRATION_IMAGE_PROMPTS),
                "unique_decoded_images": len(images), "unused_unique_images": len(images)-nc-ne,
                "original_dimensions": sizes,
                "note": "Pixel-exact duplicates removed. Near duplicates / adjacent video frames require a manual scene-level split."})

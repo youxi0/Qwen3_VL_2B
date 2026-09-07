@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import (check_splits, inspect_awq_modules, load_config,
                     prepare_manifests, read_json, read_manifest,
                     safetensor_header)
+from requantize_awq_lm_head import (diversify_repeated_questions,
+                                    select_calibration_rows)
 from torch_work import replace_named_submodule, unpack_awq_numpy
 from trt_vision_check import (classify_feature_metrics, feature_metrics,
                               profile_shapes)
@@ -123,9 +125,30 @@ class FileTests(unittest.TestCase):
             second = prepare_manifests(cfg, root / "second")
             self.assertEqual((first / "calib.jsonl").read_bytes(), (second / "calib.jsonl").read_bytes())
             self.assertEqual(read_json(first / "manifest_info.json")["unique_decoded_images"], 7)
-            check_splits(read_manifest(first / "calib.jsonl", True), read_manifest(first / "eval.jsonl"))
+            calib = read_manifest(first / "calib.jsonl", True)
+            self.assertGreater(len({row["question"] for row in calib}), 1)
+            check_splits(calib, read_manifest(first / "eval.jsonl"))
             with self.assertRaises(FileExistsError):
                 prepare_manifests(cfg, first)
+
+    def test_full_model_awq_calibration_mix(self):
+        images = [{"id": f"i{i}", "image": f"{i}.jpg", "question": "same"}
+                  for i in range(8)]
+        texts = [{"id": f"t{i}", "question": f"text {i}", "answer": "ok"}
+                 for i in range(8)]
+        diversified, changed = diversify_repeated_questions(images)
+        self.assertEqual(changed, 8)
+        self.assertGreater(len({row["question"] for row in diversified}), 1)
+        selected = select_calibration_rows(diversified, texts, 8, 0.25, 42)
+        self.assertEqual(sum(bool(row.get("image")) for row in selected), 6)
+        self.assertEqual(sum(not row.get("image") for row in selected), 2)
+
+    def test_labeled_questions_are_not_rewritten(self):
+        rows = [{"id": str(i), "image": f"{i}.jpg", "question": "same",
+                 "answer": "truth"} for i in range(4)]
+        diversified, changed = diversify_repeated_questions(rows)
+        self.assertEqual(changed, 0)
+        self.assertEqual({row["question"] for row in diversified}, {"same"})
 
     def test_split_duplicates_rejected(self):
         calib = [{"image": "a", "image_sha256": "one"}]

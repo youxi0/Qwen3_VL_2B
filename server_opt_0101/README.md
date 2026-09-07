@@ -114,35 +114,76 @@ Edge-LLM 0.10.1 的量化器不会给已经量化的 checkpoint 增量添加 LM-
 量化；它检测到已有量化后会跳过。因此从原始 FP16 checkpoint 重新校准
 decoder AWQ 与 LM head，Vision 仍不在这一步量化：
 
+先重新生成清单。新版 `prepare` 会为校准集循环使用 8 类问题（场景、物体、
+数量/颜色、空间关系、OCR、局部细节、异常和英文描述），验证集仍保持原来的
+固定问句，因此可与旧报告直接比较：
+
+```bash
+bash server_opt_0101/run_server.sh prepare \
+  --root . \
+  --out outputs/manifests-formal-diverse-v2
+```
+
+如果有真实业务文本，把它写成纯文本 JSONL；优先使用人工确认的短回答，不要
+从验证集复制。`answer` 可省略，但提供后校准序列会覆盖 Assistant 回答区间：
+
+```json
+{"id":"text_00001","question":"请判断设备状态并说明依据。","answer":"设备处于正常运行状态。"}
+{"id":"text_00002","question":"将告警级别按严重程度排序。","answer":"紧急、高、中、低。"}
+```
+
 ```bash
 python server_opt_0101/requantize_awq_lm_head.py \
   --model-dir models/Qwen3-VL-2B-Instruct \
-  --calib outputs/manifests-formal-v1/calib.jsonl \
-  --out outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-v0101 \
+  --calib outputs/manifests-formal-diverse-v2/calib.jsonl \
+  --text-calib dataset/llm_calib.jsonl \
+  --text-fraction 0.25 \
+  --alpha-step 0.05 \
+  --out outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-A005-DIVERSE-v0101 \
   --num-samples 128
 
 USE_TRT_NATIVE_ATTN=0 python -m tensorrt_edgellm.scripts.export \
-  outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-v0101 \
-  outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-ONNX-v0101 \
+  outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-A005-DIVERSE-v0101 \
+  outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-A005-DIVERSE-ONNX-v0101 \
   --skip-visual \
   --dtype float16 \
   --externalize-weights int4_ffn
 ```
 
+有足够文本时，上述 128 条会固定抽取 96 条图文和 32 条纯文本；没有现成的
+`llm_calib.jsonl` 时删掉 `--text-calib` 与 `--text-fraction`，脚本仍会自动把旧
+清单里大量重复的单一问句换成 8 类问法。图文样本不是只校准 Vision：每条都会
+经视觉塔产生视觉 token，再穿过全部 decoder 层和 LM head；纯文本与带
+`answer` 的记录用于补足文字/回答分布。`alpha-step=0.05` 把 AWQ 的 alpha 搜索
+网格相对默认 `0.1` 加密一倍，通常更慢，但不会改变最终 INT4 体积。
+此参数只作用于 LLM/LM-head AWQ，不会修改后续 Vision SmoothQuant 的
+`smoothquant_alpha=0.7`。
+
+量化结束后先确认参数确实生效：
+
+```bash
+python -m json.tool \
+  outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-A005-DIVERSE-v0101/lm_head_int4_report.json
+```
+
+报告中应看到 `awq_alpha_step: 0.05`、`image_samples: 96`、
+`text_samples: 32`（提供足够纯文本时）、`unique_questions > 1`，以及
+`total_packed_linears: 197`。
+
 量化后的 LM head 必须留在 ONNX/Engine 内，不能再传
 `--externalize-weights lm_head`；0.10.1 会主动拒绝把量化 LM head 当成
-FP16 sidecar 外置。随后使用
-`config.lmhead-int4-residual-a07.json` 跑正式流程，它会保持 decoder/LM-head
+FP16 sidecar 外置。随后复制 `config.lmhead-int4-residual-a07.json` 为新配置，
+把其中 `awq` 与 `awq_onnx` 改为上面两个 `A005-DIVERSE` 目录。新流程会保持 decoder/LM-head
 为 W4A16 AWQ，并按之前的 residual-fp16、alpha=0.7 配方重新生成 Vision
 W8A8：
 
 ```bash
 bash server_opt_0101/run_server.sh run \
   --root . \
-  --config server_opt_0101/config.lmhead-int4-residual-a07.json \
-  --calib outputs/manifests-formal-v1/calib.jsonl \
+  --config server_opt_0101/config.lmhead-int4-residual-a07-a005-diverse.json \
+  --calib outputs/manifests-formal-diverse-v2/calib.jsonl \
   --eval outputs/manifests-formal-v1/eval.jsonl \
-  --out outputs/run-formal-lmhead-int4-residual-a07-v1
+  --out outputs/run-formal-lmhead-int4-residual-a07-a005-diverse-v2
 ```
 
 新 checkpoint 应有 197 个 packed INT4 Linear（196 decoder + 1 LM head）。
