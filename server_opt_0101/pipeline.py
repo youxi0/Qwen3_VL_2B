@@ -176,9 +176,14 @@ def main():
     except Exception as exc:
         if getattr(args, "_created_output", None) is not None:
             import traceback
-            write_json(args._created_output / "reports" / "failure.json",
-                       {"error": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc(),
-                        "note": "Run failed; no acceptance or Jetson fit is claimed. Preserve this report and the console log."})
+            try:
+                write_json(args._created_output / "reports" / "failure.json",
+                           {"error": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc(),
+                            "note": "Run failed; no acceptance or Jetson fit is claimed. Preserve this report and the console log."})
+            except OSError as report_error:
+                # Do not hide the original exception when the quota is already
+                # exhausted and even the small failure report cannot be saved.
+                print(f"Could not write failure report: {report_error}", file=sys.stderr)
         raise
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import collections
+import os
 import shutil
 from pathlib import Path
 
@@ -68,6 +69,19 @@ def checkpoint_index_for_sidecar(path):
     return safetensor_header(path)
 
 
+def link_or_copy(source, destination):
+    """Hard-link large immutable artifacts when possible, copy otherwise."""
+    try:
+        os.link(source, destination)
+        return destination
+    except OSError:
+        return shutil.copy2(source, destination)
+
+
+def copytree_link_or_copy(source, destination):
+    return shutil.copytree(source, destination, copy_function=link_or_copy)
+
+
 def memory_budget(cfg, vision_checkpoint):
     awq = checkpoint_index(cfg["awq"])
     quant = checkpoint_index(vision_checkpoint)
@@ -117,9 +131,11 @@ def make_bundle(cfg, visual_onnx, destination, reports, status):
     if destination.exists():
         raise FileExistsError(destination)
     destination.mkdir(parents=True)
-    # Copy whole components: v0.10.1 FFN / lm_head sidecars are required.
-    shutil.copytree(Path(cfg["awq_onnx"]) / "llm", destination / "llm")
-    shutil.copytree(Path(visual_onnx) / "visual", destination / "visual")
+    # Keep whole components because v0.10.1 FFN/lm_head sidecars are required.
+    # The source and run output are normally on the same filesystem, so use
+    # hard links to avoid duplicating several GiB for every candidate run.
+    copytree_link_or_copy(Path(cfg["awq_onnx"]) / "llm", destination / "llm")
+    copytree_link_or_copy(Path(visual_onnx) / "visual", destination / "visual")
     limits = {key: cfg[key] for key in ("min_image_tokens", "max_image_tokens", "max_input_tokens", "max_new_tokens", "kv_cache_capacity")}
     limits.update({"batch_size": 1, "max_images_per_request": 1, "kv_cache_dtype": "fp16", "edgellm_version": "0.10.1", "visual_mha": "fp16"})
     write_json(destination / "deployment_limits.json", limits)

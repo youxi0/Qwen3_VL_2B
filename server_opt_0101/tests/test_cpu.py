@@ -20,6 +20,8 @@ from llm_layer_sensitivity import aggregate, recovery_row
 from torch_work import replace_named_submodule, unpack_awq_numpy
 from trt_vision_check import (classify_feature_metrics, feature_metrics,
                               profile_shapes)
+from vision_layer_sensitivity import (recovery_row as vision_recovery_row,
+                                      summarize_vision_rows, target_groups)
 
 
 class PackingTests(unittest.TestCase):
@@ -241,6 +243,40 @@ class MetricTests(unittest.TestCase):
         row = recovery_row("3", "decoder_block", metrics, baseline, 10.0)
         self.assertAlmostEqual(row["kl_reduction"], 0.2)
         self.assertAlmostEqual(row["kl_reduction_per_extra_mib"], 0.02)
+
+    def test_vision_grouping_and_recovery(self):
+        targets = [
+            "model.visual.blocks.0.attn.qkv",
+            "model.visual.blocks.0.mlp.linear_fc1",
+            "model.visual.deepstack_merger_list.1.linear_fc1",
+        ]
+        groups = target_groups(targets)
+        self.assertEqual(len(groups["block_0"]), 2)
+        self.assertEqual(
+            groups["deepstack_merger_1"],
+            ["model.visual.deepstack_merger_list.1.linear_fc1"],
+        )
+
+        rows = []
+        for name in ("output", "deepstack_features_0",
+                     "deepstack_features_1", "deepstack_features_2"):
+            rows.extend([
+                {"output": name, "mean_token_cosine": 0.98,
+                 "relative_l2": 0.2},
+                {"output": name, "mean_token_cosine": 0.96,
+                 "relative_l2": 0.3},
+            ])
+        baseline = summarize_vision_rows(rows, 0.99)
+        improved_rows = [dict(row, mean_token_cosine=0.985) for row in rows]
+        improved = summarize_vision_rows(improved_rows, 0.99)
+        recovery = vision_recovery_row(
+            "block_0", "vision_group", improved, baseline, 10.0,
+            groups["block_0"],
+        )
+        self.assertAlmostEqual(baseline["worst_cosine"], 0.96)
+        self.assertEqual(baseline["outputs"]["output"]["below_gate"], 2)
+        self.assertGreater(recovery["gate_deficit_reduction"], 0)
+        self.assertGreater(recovery["worst_cosine_gain"], 0)
 
     def test_identical(self):
         values = np.array([[1, 2, 3], [-1, 3, 1]], dtype=np.float16)
