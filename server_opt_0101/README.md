@@ -108,6 +108,48 @@ python server_opt_0101/trt_vision_check.py \
 
 如果暂时没有服务器插件，先完成第 3 节，把结果标记为“量化/导出完成、Engine 未验证”，不要将它当成通过部署验收。
 
+## 5.1 可选：把 tied LM head 也量化为 INT4 AWQ
+
+Edge-LLM 0.10.1 的量化器不会给已经量化的 checkpoint 增量添加 LM-head
+量化；它检测到已有量化后会跳过。因此从原始 FP16 checkpoint 重新校准
+decoder AWQ 与 LM head，Vision 仍不在这一步量化：
+
+```bash
+python server_opt_0101/requantize_awq_lm_head.py \
+  --model-dir models/Qwen3-VL-2B-Instruct \
+  --calib outputs/manifests-formal-v1/calib.jsonl \
+  --out outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-v0101 \
+  --num-samples 128
+
+USE_TRT_NATIVE_ATTN=0 python -m tensorrt_edgellm.scripts.export \
+  outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-v0101 \
+  outputs/Qwen3-VL-2B-INT4-AWQ-LMHEAD-ONNX-v0101 \
+  --components llm \
+  --dtype float16 \
+  --externalize-weights int4_ffn
+```
+
+量化后的 LM head 必须留在 ONNX/Engine 内，不能再传
+`--externalize-weights lm_head`；0.10.1 会主动拒绝把量化 LM head 当成
+FP16 sidecar 外置。随后使用
+`config.lmhead-int4-residual-a07.json` 跑正式流程，它会保持 decoder/LM-head
+为 W4A16 AWQ，并按之前的 residual-fp16、alpha=0.7 配方重新生成 Vision
+W8A8：
+
+```bash
+bash server_opt_0101/run_server.sh run \
+  --root . \
+  --config server_opt_0101/config.lmhead-int4-residual-a07.json \
+  --calib outputs/manifests-formal-v1/calib.jsonl \
+  --eval outputs/manifests-formal-v1/eval.jsonl \
+  --out outputs/run-formal-lmhead-int4-residual-a07-v1
+```
+
+新 checkpoint 应有 197 个 packed INT4 Linear（196 decoder + 1 LM head）。
+最终候选不再包含 593.5 MiB 的 FP16 `external_lm_head_weight.safetensors`；
+实际节省量以新 `memory_budget.json` 为准。重新校准意味着 decoder AWQ
+尺度也会重算，必须重新查看 AWQ 与组合端到端指标，不能沿用旧报告。
+
 ## 6. 输出与内存判断
 
 ```text

@@ -20,6 +20,7 @@ VISION_RECIPE_EXPECTED = {
     "residual_fp16": 52,
     "all_linears": 104,
 }
+AWQ_BACKBONE_LINEAR_COUNT = 196
 
 
 def read_json(path):
@@ -91,6 +92,36 @@ def checkpoint_index(folder):
         return {key: (folder / name, headers[name][key]) for key, name in mapping.items()}
     single = folder / "model.safetensors"
     return {key: (single, entry) for key, entry in safetensor_header(single).items()}
+
+
+def inspect_awq_modules(index):
+    """Validate this model's packed ModelOpt AWQ module layout.
+
+    The original checkpoint has 196 decoder linears.  A second supported
+    layout adds a packed ``lm_head`` while keeping the embedding and visual
+    tower unquantized.
+    """
+    packed = {
+        key[:-7] for key, (_, entry) in index.items()
+        if key.endswith(".weight") and entry["dtype"] == "U8"
+    }
+    backbone = {
+        name for name in packed
+        if name.startswith("model.language_model.layers.")
+    }
+    allowed = backbone | ({"lm_head"} if "lm_head" in packed else set())
+    unexpected = sorted(packed - allowed)
+    if len(backbone) != AWQ_BACKBONE_LINEAR_COUNT or unexpected:
+        raise ValueError(
+            "Expected 196 packed decoder linears plus optional packed "
+            f"lm_head; backbone={len(backbone)}, unexpected={unexpected[:8]}"
+        )
+    return {
+        "packed_modules": packed,
+        "backbone_linears": len(backbone),
+        "lm_head_int4": "lm_head" in packed,
+        "total_packed_linears": len(packed),
+    }
 
 
 def versions(strict=True):

@@ -7,8 +7,8 @@ import json
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from common import (VISION_RECIPE_EXPECTED, checkpoint_index, read_json,
-                    write_json)
+from common import (VISION_RECIPE_EXPECTED, checkpoint_index,
+                    inspect_awq_modules, read_json, write_json)
 
 
 def vision_linear_is_target(name, recipe):
@@ -165,11 +165,8 @@ def load_awq_reference(cfg):
             return F.linear(x * self.pre_quant_scale, self.weight, self.bias)
 
     try:
-        quant_names = {key[:-7] for key, (_, entry) in source.index.items()
-                       if key.endswith(".weight") and entry["dtype"] == "U8"}
-        expected = cfg.get("expected_awq_linears", 196)
-        if len(quant_names) != expected:
-            raise ValueError(f"Expected {expected} packed LLM linears; found {len(quant_names)}")
+        awq_layout = inspect_awq_modules(source.index)
+        quant_names = awq_layout["packed_modules"]
         with torch.no_grad():
             # Copy norms, embedding, visual tower and all unquantized tensors
             # from AWQ, rather than silently substituting original weights.
@@ -186,7 +183,8 @@ def load_awq_reference(cfg):
                 dest.copy_(value.to(device=dest.device, dtype=dest.dtype))
 
             for name in sorted(quant_names):
-                if not name.startswith("model.language_model.layers."):
+                if (name != "lm_head" and
+                        not name.startswith("model.language_model.layers.")):
                     raise ValueError(f"Unexpected quantized module {name}")
                 old = model.get_submodule(name)
                 q = source.get(name + ".weight").numpy()

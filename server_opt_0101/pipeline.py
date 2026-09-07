@@ -9,7 +9,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from common import PACKAGE, check_splits, checkpoint_index, load_config, prepare_manifests, read_json, read_manifest, versions, write_json
+from common import (PACKAGE, check_splits, checkpoint_index,
+                    inspect_awq_modules, load_config, prepare_manifests,
+                    read_json, read_manifest, versions, write_json)
 
 
 def preflight(cfg, strict=False):
@@ -19,9 +21,12 @@ def preflight(cfg, strict=False):
     if oc["model_type"] != "qwen3_vl" or oc["vision_config"]["depth"] != 24 or oc["text_config"]["hidden_size"] != 2048:
         raise ValueError("Expected Qwen3-VL-2B-Instruct")
     qcfg = read_json(Path(cfg["awq"]) / "hf_quant_config.json")["quantization"]
-    packed_count = sum(k.endswith(".weight") and v["dtype"] == "U8" for k, (_, v) in awq.items())
-    if qcfg.get("quant_algo") != "W4A16_AWQ" or qcfg.get("has_zero_point", False) or packed_count != 196:
-        raise ValueError("Expected ModelOpt symmetric W4A16_AWQ with 196 packed linears")
+    awq_layout = inspect_awq_modules(awq)
+    if qcfg.get("quant_algo") != "W4A16_AWQ" or qcfg.get("has_zero_point", False):
+        raise ValueError("Expected symmetric ModelOpt W4A16_AWQ")
+    excluded = set(qcfg.get("exclude_modules", []))
+    if awq_layout["lm_head_int4"] and "lm_head" in excluded:
+        raise ValueError("Packed lm_head conflicts with hf_quant_config exclusion")
     llm = Path(cfg["awq_onnx"]) / "llm"
     config = read_json(llm / "config.json")
     if config.get("edgellm_version") != "0.10.1":
@@ -31,7 +36,10 @@ def preflight(cfg, strict=False):
             raise FileNotFoundError(llm / name)
     return {"paths": {k: cfg[k] for k in ("original", "awq", "awq_onnx", "images")},
             "original_tensors": len(original), "awq_tensors": len(awq),
-            "awq_packed_linears": packed_count, "awq_group_size": qcfg["group_size"],
+            "awq_packed_linears": awq_layout["total_packed_linears"],
+            "awq_backbone_linears": awq_layout["backbone_linears"],
+            "lm_head_int4": awq_layout["lm_head_int4"],
+            "awq_group_size": qcfg["group_size"],
             "llm_onnx_version": config["edgellm_version"],
             "required_llm_sidecars": [{"file": r["file"], "tensor_count": len(r["tensors"])} for r in config.get("external_weight_files", [])],
             "environment": versions(strict), "host": platform.platform()}

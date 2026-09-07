@@ -78,7 +78,16 @@ def memory_budget(cfg, vision_checkpoint):
     text = read_json(Path(cfg["original"]) / "config.json")["text_config"]
     # HF tied embedding is often serialized once, but this Edge runtime has
     # separate embedding and lm_head resources. Count both; do not claim tying.
-    extra_head = 0 if "lm_head.weight" in awq else text["vocab_size"] * text["hidden_size"] * 2
+    fp16_head = text["vocab_size"] * text["hidden_size"] * 2
+    head_items = {
+        key: value for key, value in awq.items()
+        if key == "lm_head.weight" or key.startswith("lm_head.")
+    }
+    checkpoint_head = sum(nbytes(value) for _, value in head_items.values())
+    head_int4 = bool(
+        "lm_head.weight" in awq and awq["lm_head.weight"][1]["dtype"] == "U8"
+    )
+    extra_head = 0 if "lm_head.weight" in awq else fp16_head
     kv_per_token = 2 * text["num_hidden_layers"] * text["num_key_value_heads"] * text["head_dim"] * 2
     kv = kv_per_token * cfg["kv_cache_capacity"]
     weights = awq_non_visual + int8_visual + extra_head
@@ -87,6 +96,10 @@ def memory_budget(cfg, vision_checkpoint):
     available = cfg["jetson_total_gib"] * 2**30
     return {"awq_llm_and_embedding_mib": awq_non_visual / 2**20,
             "extra_runtime_lm_head_mib": extra_head / 2**20,
+            "checkpoint_lm_head_mib": checkpoint_head / 2**20,
+            "lm_head_int4": head_int4,
+            "lm_head_saving_vs_fp16_mib": ((fp16_head - checkpoint_head) / 2**20
+                                             if head_int4 else 0.0),
             "vision_fp16_mib": awq_visual / 2**20, "vision_int8_mib": int8_visual / 2**20,
             "vision_weight_saving_mib": (awq_visual - int8_visual) / 2**20,
             "total_logical_weight_mib": weights / 2**20,

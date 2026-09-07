@@ -10,7 +10,9 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import check_splits, load_config, prepare_manifests, read_json, read_manifest, safetensor_header
+from common import (check_splits, inspect_awq_modules, load_config,
+                    prepare_manifests, read_json, read_manifest,
+                    safetensor_header)
 from torch_work import unpack_awq_numpy
 from trt_vision_check import (classify_feature_metrics, feature_metrics,
                               profile_shapes)
@@ -34,6 +36,38 @@ class PackingTests(unittest.TestCase):
     def test_reject_wrong_rank(self):
         with self.assertRaises(ValueError):
             unpack_awq_numpy(np.ones(8, dtype=np.uint8))
+
+    def test_awq_layout_accepts_optional_int4_lm_head(self):
+        def item(dtype="U8"):
+            return Path("weights.safetensors"), {
+                "dtype": dtype, "shape": [1], "data_offsets": [0, 1]
+            }
+
+        index = {
+            f"model.language_model.layers.{i}.proj.weight": item()
+            for i in range(196)
+        }
+        base = inspect_awq_modules(index)
+        self.assertEqual(base["total_packed_linears"], 196)
+        self.assertFalse(base["lm_head_int4"])
+        index["lm_head.weight"] = item()
+        with_head = inspect_awq_modules(index)
+        self.assertEqual(with_head["total_packed_linears"], 197)
+        self.assertTrue(with_head["lm_head_int4"])
+
+    def test_awq_layout_rejects_quantized_embedding(self):
+        def item():
+            return Path("weights.safetensors"), {
+                "dtype": "U8", "shape": [1], "data_offsets": [0, 1]
+            }
+
+        index = {
+            f"model.language_model.layers.{i}.proj.weight": item()
+            for i in range(196)
+        }
+        index["model.language_model.embed_tokens.weight"] = item()
+        with self.assertRaises(ValueError):
+            inspect_awq_modules(index)
 
 
 class FileTests(unittest.TestCase):
