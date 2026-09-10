@@ -22,6 +22,8 @@ from trt_vision_check import (classify_feature_metrics, feature_metrics,
                               profile_shapes)
 from vision_layer_sensitivity import (recovery_row as vision_recovery_row,
                                       summarize_vision_rows, target_groups)
+from splice_awq_fp16_modules import (add_quantization_exclusions,
+                                     tensor_belongs_to_any_module)
 
 
 class PackingTests(unittest.TestCase):
@@ -118,6 +120,21 @@ class PackingTests(unittest.TestCase):
 
 
 class FileTests(unittest.TestCase):
+    def test_fp16_splice_selection_and_metadata(self):
+        module = "model.language_model.layers.20.self_attn.o_proj"
+        self.assertTrue(tensor_belongs_to_any_module(
+            module + ".weight_scale", [module]))
+        self.assertFalse(tensor_belongs_to_any_module(
+            "model.language_model.layers.2.self_attn.o_proj.weight",
+            [module],
+        ))
+        config = {"quantization": {"exclude_modules": ["model.visual.*"]}}
+        add_quantization_exclusions(config, [module, module])
+        self.assertEqual(
+            config["quantization"]["exclude_modules"],
+            ["model.visual.*", module],
+        )
+
     def test_safetensors_valid_and_truncated(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "model.safetensors"
