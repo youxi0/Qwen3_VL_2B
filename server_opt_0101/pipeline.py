@@ -35,6 +35,8 @@ def preflight(cfg, strict=False):
         if not (llm / name).is_file():
             raise FileNotFoundError(llm / name)
     return {"paths": {k: cfg[k] for k in ("original", "awq", "awq_onnx", "images")},
+            "vision_recipe": cfg["vision_recipe"],
+            "vision_fp16_blocks": cfg.get("vision_fp16_blocks", []),
             "original_tensors": len(original), "awq_tensors": len(awq),
             "awq_packed_linears": awq_layout["total_packed_linears"],
             "awq_backbone_linears": awq_layout["backbone_linears"],

@@ -240,6 +240,21 @@ class FileTests(unittest.TestCase):
                 load_config(path, temporary)["vision_recipe"],
                 "residual_fp16")
 
+    def test_vision_fp16_blocks_are_validated_and_normalized(self):
+        source = Path(__file__).resolve().parents[1] / "config.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.json"
+            data = read_json(source)
+            data["vision_fp16_blocks"] = [11, 0, 11]
+            path.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(
+                load_config(path, temporary)["vision_fp16_blocks"], [0, 11]
+            )
+            data["vision_fp16_blocks"] = [24]
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_config(path, temporary)
+
 
 class MetricTests(unittest.TestCase):
     def test_layer_recovery_metrics_are_token_weighted(self):

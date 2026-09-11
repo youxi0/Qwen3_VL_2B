@@ -249,7 +249,8 @@ def main():
         )
 
         requested_blocks = (
-            list(range(24)) if args.blocks is None
+            [block for block in range(24)
+             if f"block_{block}" in groups] if args.blocks is None
             else sorted(set(args.blocks))
         )
         requested_groups = []

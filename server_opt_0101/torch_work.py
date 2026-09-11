@@ -11,7 +11,7 @@ from common import (VISION_RECIPE_EXPECTED, checkpoint_index,
                     inspect_awq_modules, read_json, write_json)
 
 
-def vision_linear_is_target(name, recipe):
+def vision_linear_is_target(name, recipe, fp16_blocks=()):
     """Return whether a Qwen3-VL Vision Linear belongs to a named recipe.
 
     ``residual_fp16`` keeps the two projections that write directly into each
@@ -25,6 +25,13 @@ def vision_linear_is_target(name, recipe):
     if not name.startswith("model.visual."):
         return False
     is_block = name.startswith("model.visual.blocks.")
+    if is_block:
+        try:
+            block = int(name.split(".")[3])
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"Malformed Vision block module name: {name}") from exc
+        if block in set(fp16_blocks):
+            return False
     if recipe == "all_linears":
         return True
     if recipe == "blocks":
@@ -503,17 +510,27 @@ def quantize_vision(model, processor, calibration, cfg):
         raise ValueError(
             f"Unknown vision_recipe {recipe_name!r}; choose from "
             f"{sorted(VISION_RECIPE_EXPECTED)}")
+    fp16_blocks = cfg.get("vision_fp16_blocks", [])
+    base_targets = []
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear) or not name.startswith("model.visual."):
             continue
         if vision_linear_is_target(name, recipe_name):
+            base_targets.append(name)
+        if vision_linear_is_target(name, recipe_name, fp16_blocks):
             targets.append(name)
-    expected = VISION_RECIPE_EXPECTED[recipe_name]
-    if len(targets) != expected:
+    expected_base = VISION_RECIPE_EXPECTED[recipe_name]
+    if len(base_targets) != expected_base:
         raise ValueError(
-            f"Vision {recipe_name} whitelist mismatch: expected {expected}, "
-            f"found {len(targets)}")
+            f"Vision {recipe_name} base whitelist mismatch: expected "
+            f"{expected_base}, found {len(base_targets)}")
+    fallback_modules = sorted(set(base_targets) - set(targets))
+    expected_targets = expected_base - len(fallback_modules)
+    if len(targets) != expected_targets:
+        raise ValueError(
+            f"Vision FP16 fallback mismatch: expected {expected_targets} "
+            f"INT8 modules, found {len(targets)}")
     recipe = copy.deepcopy(mtq.INT8_SMOOTHQUANT_CFG)
     recipe["quant_cfg"] = [{"quantizer_name": "*", "enable": False}]
     for name in targets:
@@ -559,6 +576,9 @@ def quantize_vision(model, processor, calibration, cfg):
                         "smoother_min": pqs.min().item(), "smoother_max": pqs.max().item()})
     mtq.print_quant_summary(model)
     return {"recipe": recipe, "quantized_modules": summary, "calibration_samples": len(calibration),
+            "base_recipe_quantized_module_count": expected_base,
+            "configured_fp16_blocks": fp16_blocks,
+            "fp16_fallback_modules": fallback_modules,
             "enabled_quantizer_count": len(enabled), "smoothquant_scale_checks": smoother_checks,
             "zero_channel_repair_policy": "Only NaN from exactly zero activation range AND zero weight column uses neutral scale 1; all other invalid statistics fail."}
 

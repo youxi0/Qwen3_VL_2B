@@ -49,6 +49,31 @@ class VisionRecipeTests(unittest.TestCase):
         self.assertFalse(vision_linear_is_target(
             "model.language_model.layers.0.mlp.down_proj", recipe))
 
+    def test_selected_blocks_fall_back_to_fp16(self):
+        fp16_blocks = [0, 4, 5, 11]
+        names = qwen3_vl_linear_names()
+        selected = [
+            name for name in names
+            if vision_linear_is_target(name, "residual_fp16", fp16_blocks)
+        ]
+        self.assertEqual(len(selected), 44)
+        self.assertFalse(vision_linear_is_target(
+            "model.visual.blocks.0.attn.qkv",
+            "residual_fp16", fp16_blocks,
+        ))
+        self.assertFalse(vision_linear_is_target(
+            "model.visual.blocks.11.mlp.linear_fc1",
+            "residual_fp16", fp16_blocks,
+        ))
+        self.assertTrue(vision_linear_is_target(
+            "model.visual.blocks.12.attn.qkv",
+            "residual_fp16", fp16_blocks,
+        ))
+        self.assertTrue(vision_linear_is_target(
+            "model.visual.deepstack_merger_list.1.linear_fc1",
+            "residual_fp16", fp16_blocks,
+        ))
+
     def test_unknown_recipe_fails(self):
         with self.assertRaises(ValueError):
             vision_linear_is_target("model.visual.blocks.0.attn.qkv", "typo")

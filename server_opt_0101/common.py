@@ -76,6 +76,16 @@ def load_config(path, root):
         raise ValueError(
             f"Unknown vision_recipe {cfg['vision_recipe']!r}; choose from "
             f"{sorted(VISION_RECIPE_EXPECTED)}")
+    fp16_blocks = cfg.get("vision_fp16_blocks", [])
+    if (not isinstance(fp16_blocks, list)
+            or any(isinstance(block, bool) or not isinstance(block, int)
+                   for block in fp16_blocks)):
+        raise ValueError("vision_fp16_blocks must be a list of integer block indices")
+    invalid_blocks = sorted({block for block in fp16_blocks
+                             if not 0 <= block < 24})
+    if invalid_blocks:
+        raise ValueError(f"Invalid vision_fp16_blocks: {invalid_blocks}")
+    cfg["vision_fp16_blocks"] = sorted(set(fp16_blocks))
     return cfg
 
 

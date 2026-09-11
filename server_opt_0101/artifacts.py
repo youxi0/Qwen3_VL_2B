@@ -137,7 +137,8 @@ def make_bundle(cfg, visual_onnx, destination, reports, status):
     copytree_link_or_copy(Path(cfg["awq_onnx"]) / "llm", destination / "llm")
     copytree_link_or_copy(Path(visual_onnx) / "visual", destination / "visual")
     limits = {key: cfg[key] for key in ("min_image_tokens", "max_image_tokens", "max_input_tokens", "max_new_tokens", "kv_cache_capacity")}
-    limits.update({"batch_size": 1, "max_images_per_request": 1, "kv_cache_dtype": "fp16", "edgellm_version": "0.10.1", "visual_mha": "fp16"})
+    limits.update({"batch_size": 1, "max_images_per_request": 1, "kv_cache_dtype": "fp16", "edgellm_version": "0.10.1", "visual_mha": "fp16",
+                   "vision_fp16_blocks": cfg.get("vision_fp16_blocks", [])})
     write_json(destination / "deployment_limits.json", limits)
     write_json(destination / "STATUS.json", status)
     shutil.copytree(reports, destination / "reports")
