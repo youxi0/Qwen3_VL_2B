@@ -1,7 +1,6 @@
-dataset/
+Qwen3-VL-2B-Instruct/
+runtime_cpp/build/
+
+output/
 models/
-# Generated model weights and runtime engines
-*.safetensors
-*.onnx.data
-*.engine
-*.plan
+runtime_cpp/build/
