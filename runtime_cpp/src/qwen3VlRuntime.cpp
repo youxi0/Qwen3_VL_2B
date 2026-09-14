@@ -6,6 +6,8 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/streaming.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 
 #include <NvInfer.h>
 #include <chrono>
@@ -23,6 +25,31 @@ namespace
 {
 
 using PluginHandle = std::unique_ptr<void, trt_edgellm::DlDeleter>;
+using Clock = std::chrono::steady_clock;
+
+class ProfilingScope
+{
+public:
+    ProfilingScope()
+    {
+        trt_edgellm::gTimer.reset();
+        trt_edgellm::setProfilingEnabled(true);
+    }
+
+    ~ProfilingScope()
+    {
+        trt_edgellm::setProfilingEnabled(false);
+    }
+
+    ProfilingScope(ProfilingScope const&) = delete;
+    ProfilingScope& operator=(ProfilingScope const&) = delete;
+};
+
+double stageTimeMs(std::string const& stageName)
+{
+    auto const timing = trt_edgellm::gTimer.getTimingData(stageName);
+    return timing ? timing->getTotalGpuTimeMs() : 0.0;
+}
 
 void checkCuda(cudaError_t status, char const* operation)
 {
@@ -138,7 +165,7 @@ trt_edgellm::rt::LLMGenerationRequest makeRequest(GenerationRequest const& input
     return request;
 }
 
-} // namespace
+} // 匿名命名空间
 
 class Qwen3VlRuntime::Impl
 {
@@ -185,7 +212,8 @@ public:
     {
         std::lock_guard<std::mutex> const lock(mMutex);
         GenerationResponse result;
-        auto start = std::chrono::steady_clock::now();
+        auto start = Clock::now();
+        std::vector<Clock::time_point> tokenTimes;
 
         try
         {
@@ -197,16 +225,29 @@ public:
             {
                 runWarmup(input);
                 mWarmupComplete = true;
-                start = std::chrono::steady_clock::now();
+                start = Clock::now();
             }
 
             auto request = makeRequest(input);
+            request.onTokenGenerated = [&tokenTimes](trt_edgellm::rt::TokenCallbackInfo const& info) {
+                if (info.batchIdx == 0)
+                {
+                    tokenTimes.push_back(Clock::now());
+                }
+            };
             trt_edgellm::rt::LLMGenerationResponse response;
-            if (!mRuntime->handleRequest(request, response, mStream))
             {
-                throw std::runtime_error("LLMInferenceRuntime::handleRequest returned false");
+                ProfilingScope const profilingScope;
+                if (!mRuntime->handleRequest(request, response, mStream))
+                {
+                    throw std::runtime_error("LLMInferenceRuntime::handleRequest returned false");
+                }
+                checkCuda(cudaStreamSynchronize(mStream), "cudaStreamSynchronize");
             }
-            checkCuda(cudaStreamSynchronize(mStream), "cudaStreamSynchronize");
+
+            result.visionLatencyMs = stageTimeMs(trt_edgellm::metrics::StageNames::kVISION_ENCODER);
+            result.prefillLatencyMs = stageTimeMs(trt_edgellm::metrics::StageNames::kLLM_PREFILL);
+            result.decodeLatencyMs = stageTimeMs(trt_edgellm::metrics::StageNames::kLLM_GENERATION);
 
             if (response.outputTexts.size() != 1U || response.outputIds.size() != 1U)
             {
@@ -234,11 +275,25 @@ public:
             result.error = "unknown runtime failure";
         }
 
-        auto const end = std::chrono::steady_clock::now();
+        auto const end = Clock::now();
         result.latencyMs = std::chrono::duration<double, std::milli>(end - start).count();
         if (result.ok && result.latencyMs > 0.0)
         {
             result.tokensPerSecond = static_cast<double>(result.tokenIds.size()) * 1000.0 / result.latencyMs;
+        }
+        if (!tokenTimes.empty())
+        {
+            result.timeToFirstTokenMs = std::chrono::duration<double, std::milli>(tokenTimes.front() - start).count();
+        }
+        if (tokenTimes.size() > 1U)
+        {
+            result.timePerOutputTokenMs
+                = std::chrono::duration<double, std::milli>(tokenTimes.back() - tokenTimes.front()).count()
+                / static_cast<double>(tokenTimes.size() - 1U);
+            if (result.timePerOutputTokenMs > 0.0)
+            {
+                result.decodeTokensPerSecond = 1000.0 / result.timePerOutputTokenMs;
+            }
         }
         return result;
     }
@@ -344,4 +399,4 @@ bool Qwen3VlRuntime::cudaGraphCaptured() const noexcept
     return mImpl && mImpl->cudaGraphCaptured();
 }
 
-} // namespace qwen3_vl
+} // 命名空间 qwen3_vl

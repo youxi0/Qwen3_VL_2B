@@ -47,16 +47,22 @@ struct GenerationResponse
     int32_t inputTokens{0};
     double latencyMs{0.0};
     double tokensPerSecond{0.0};
+    double timeToFirstTokenMs{0.0};
+    double timePerOutputTokenMs{0.0};
+    double decodeTokensPerSecond{0.0};
+    double visionLatencyMs{0.0};
+    double prefillLatencyMs{0.0};
+    double decodeLatencyMs{0.0};
 };
 
-//! Project-owned, single-device Qwen3-VL runtime.
+//! 本项目专用的单设备 Qwen3-VL 运行时。
 //!
-//! One instance owns one non-blocking CUDA stream and keeps the model resources
-//! resident. Calls to generate() are serialized on that instance.
+//! 每个实例独占一个非阻塞 CUDA 流，并让模型资源常驻内存。
+//! 同一实例上的 generate() 调用会串行执行。
 class Qwen3VlRuntime
 {
 public:
-    //! Create and initialize a runtime without propagating dependency exceptions.
+    //! 创建并初始化运行时，依赖库异常不会向调用方传播。
     static std::unique_ptr<Qwen3VlRuntime> create(RuntimeConfig const& config, std::string& error) noexcept;
 
     ~Qwen3VlRuntime() noexcept;
@@ -64,10 +70,10 @@ public:
     Qwen3VlRuntime(Qwen3VlRuntime const&) = delete;
     Qwen3VlRuntime& operator=(Qwen3VlRuntime const&) = delete;
 
-    //! Run one batch-one request and return generated text and timing data.
+    //! 执行一个批大小为 1 的请求，并返回生成文本及耗时数据。
     GenerationResponse generate(GenerationRequest const& request) noexcept;
 
-    //! Return whether decode CUDA Graph capture succeeded during initialization.
+    //! 返回初始化期间是否成功捕获解码 CUDA Graph。
     bool cudaGraphCaptured() const noexcept;
 
 private:
@@ -78,4 +84,4 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
-} // namespace qwen3_vl
+} // 命名空间 qwen3_vl

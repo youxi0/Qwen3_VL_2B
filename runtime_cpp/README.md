@@ -34,6 +34,9 @@ runtime_cpp/build/qwen3_vl_cli \
 
 Use `--repeat N` to verify that one initialized runtime serves multiple requests.
 `--warmup N` runs full requests before the first measured request.
+`--json-output PATH` writes TTFT, TPOT, decode throughput, stage GPU timings,
+token IDs, and request latency in a stable machine-readable format. The project
+benchmark scripts under `benchmark/` use this interface.
 
 ## API
 

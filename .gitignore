@@ -1,6 +1,7 @@
 Qwen3-VL-2B-Instruct/
 runtime_cpp/build/
+benchmark/scripts/__pycache__/
 
 output/
 models/
-runtime_cpp/build/
+

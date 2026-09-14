@@ -1,0 +1,60 @@
+{
+  "paths": {
+    "runtime_cli": "runtime_cpp/build/qwen3_vl_cli",
+    "llm_bench": "/home/jetson/TensorRT-Edge-LLM/build-v0101/examples/llm/llm_bench",
+    "trtexec": "/usr/bin/trtexec",
+    "nsys": "/usr/local/cuda-13.2/bin/nsys",
+    "ncu": "/usr/local/cuda-13.2/bin/ncu",
+    "plugin": "/home/jetson/TensorRT-Edge-LLM/build-v0101/libNvInfer_edgellm_plugin.so.1.0",
+    "llm_engine_dir": "models/engines-jetson-20260911-profiled/llm",
+    "multimodal_engine_dir": "models/engines-jetson-20260911-profiled"
+  },
+  "request": {
+    "image": "dataset/0.jpg",
+    "prompt": "请简短描述这张图片。",
+    "max_new_tokens": 32
+  },
+  "e2e": {
+    "cold_runs": 1,
+    "steady_warmup": 1,
+    "steady_runs": 5,
+    "memory_sample_interval_ms": 100
+  },
+  "layer_profile": {
+    "iterations": 10,
+    "warmup": 3,
+    "batch_size": 1,
+    "prefill_input_len": 71,
+    "decode_past_kv_len": 96,
+    "visual_height": 192,
+    "visual_width": 288
+  },
+  "capacity": {
+    "iterations": 3,
+    "warmup": 1
+  },
+  "nsys": {
+    "iterations": 10,
+    "warmup": 3
+  },
+  "ncu": {
+    "default_stage": "decode",
+    "launch_count": 1,
+    "metrics": [
+      "gpu__time_duration.sum",
+      "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+      "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+      "lts__throughput.avg.pct_of_peak_sustained_elapsed",
+      "sm__warps_active.avg.pct_of_peak_sustained_active",
+      "launch__occupancy_limit_blocks",
+      "launch__occupancy_limit_registers",
+      "launch__occupancy_limit_shared_mem",
+      "launch__occupancy_limit_warps",
+      "launch__waves_per_multiprocessor"
+    ]
+  },
+  "quality": {
+    "enabled": false,
+    "cases_file": "benchmark/quality_cases.jsonl"
+  }
+}

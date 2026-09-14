@@ -2,9 +2,12 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -18,6 +21,7 @@ struct Arguments
     qwen3_vl::RuntimeConfig runtime;
     qwen3_vl::GenerationRequest request;
     int32_t repeat{1};
+    std::string jsonOutput;
 };
 
 void printUsage(char const* program)
@@ -38,6 +42,7 @@ void printUsage(char const* program)
                  "  --no-cuda-graph           Disable decode CUDA Graph capture\n"
                  "  --warmup N                Full-request warmup count; default: 0\n"
                  "  --repeat N                Run the same request N times; default: 1\n"
+                 "  --json-output PATH        Write machine-readable metrics to JSON\n"
                  "  --verbose                 Enable verbose Edge-LLM logging\n"
                  "  -h, --help                Show this help\n";
 }
@@ -160,6 +165,10 @@ Arguments parseArguments(int argc, char** argv)
         {
             args.repeat = parseInt32(takeValue(index, argc, argv, option), option);
         }
+        else if (option == "--json-output")
+        {
+            args.jsonOutput = takeValue(index, argc, argv, option);
+        }
         else if (option == "--enable-thinking")
         {
             args.request.enableThinking = true;
@@ -211,7 +220,7 @@ Arguments parseArguments(int argc, char** argv)
     return args;
 }
 
-} // namespace
+} // 匿名命名空间
 
 int main(int argc, char** argv)
 {
@@ -238,6 +247,7 @@ int main(int argc, char** argv)
     std::cout << "Runtime ready; CUDA Graph: " << (runtime->cudaGraphCaptured() ? "captured" : "disabled/unavailable")
               << '\n';
 
+    nlohmann::json runs = nlohmann::json::array();
     for (int32_t run = 0; run < args.repeat; ++run)
     {
         qwen3_vl::GenerationResponse response = runtime->generate(args.request);
@@ -250,7 +260,38 @@ int main(int argc, char** argv)
         std::cout << "\n[run " << run + 1 << "] " << response.text << "\n"
                   << "input_tokens=" << response.inputTokens << ", generated_tokens=" << response.tokenIds.size()
                   << ", finish=" << response.finishReason << ", latency_ms=" << std::fixed << std::setprecision(2)
-                  << response.latencyMs << ", tokens_per_second=" << response.tokensPerSecond << '\n';
+                  << response.latencyMs << ", tokens_per_second=" << response.tokensPerSecond
+                  << ", ttft_ms=" << response.timeToFirstTokenMs << ", tpot_ms=" << response.timePerOutputTokenMs
+                  << ", decode_tokens_per_second=" << response.decodeTokensPerSecond
+                  << ", vision_latency_ms=" << response.visionLatencyMs
+                  << ", prefill_latency_ms=" << response.prefillLatencyMs
+                  << ", decode_latency_ms=" << response.decodeLatencyMs << '\n';
+
+        runs.push_back({{"run", run + 1}, {"text", response.text}, {"token_ids", response.tokenIds},
+            {"input_tokens", response.inputTokens}, {"generated_tokens", response.tokenIds.size()},
+            {"finish_reason", response.finishReason}, {"latency_ms", response.latencyMs},
+            {"tokens_per_second", response.tokensPerSecond}, {"ttft_ms", response.timeToFirstTokenMs},
+            {"tpot_ms", response.timePerOutputTokenMs},
+            {"decode_tokens_per_second", response.decodeTokensPerSecond},
+            {"vision_latency_ms", response.visionLatencyMs}, {"prefill_latency_ms", response.prefillLatencyMs},
+            {"decode_latency_ms", response.decodeLatencyMs}});
+    }
+
+    if (!args.jsonOutput.empty())
+    {
+        std::filesystem::path const outputPath{args.jsonOutput};
+        if (outputPath.has_parent_path())
+        {
+            std::filesystem::create_directories(outputPath.parent_path());
+        }
+        std::ofstream output(outputPath);
+        if (!output)
+        {
+            std::cerr << "Failed to open JSON output: " << outputPath << '\n';
+            return EXIT_FAILURE;
+        }
+        nlohmann::json const document{{"cuda_graph_captured", runtime->cudaGraphCaptured()}, {"runs", runs}};
+        output << document.dump(2) << '\n';
     }
     return EXIT_SUCCESS;
 }

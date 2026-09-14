@@ -14,6 +14,7 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 87)
 endif()
 
+# set(变量名 值 CACHE 类型 说明)
 set(EDGELLM_SOURCE_DIR "/home/jetson/TensorRT-Edge-LLM" CACHE PATH
     "TensorRT Edge-LLM source directory")
 set(EDGELLM_BUILD_DIR "${EDGELLM_SOURCE_DIR}/build-v0101" CACHE PATH
@@ -91,6 +92,9 @@ set_target_properties(
              POSITION_INDEPENDENT_CODE ON)
 
 add_executable(qwen3_vl_cli src/main.cpp)
+target_include_directories(
+  qwen3_vl_cli
+  PRIVATE ${EDGELLM_SOURCE_DIR}/3rdParty/nlohmannJson/include)
 target_compile_options(qwen3_vl_cli PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(qwen3_vl_cli PRIVATE qwen3_vl_runtime)
 target_link_options(qwen3_vl_cli PRIVATE
