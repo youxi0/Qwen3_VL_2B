@@ -14,8 +14,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 87)
 endif()
 
-# set(变量名 值 CACHE 类型 说明)
-set(EDGELLM_SOURCE_DIR "/home/jetson/TensorRT-Edge-LLM" CACHE PATH
+get_filename_component(QWEN3_VL_PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+set(EDGELLM_SOURCE_DIR "${QWEN3_VL_PROJECT_ROOT}/third_party/TensorRT-Edge-LLM" CACHE PATH
     "TensorRT Edge-LLM source directory")
 set(EDGELLM_BUILD_DIR "${EDGELLM_SOURCE_DIR}/build-v0101" CACHE PATH
     "TensorRT Edge-LLM build directory")

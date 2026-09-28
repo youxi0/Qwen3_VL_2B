@@ -9,11 +9,12 @@ TensorRT Edge-LLM's public `LLMInferenceRuntime` API.
 
 ```bash
 cd /home/jetson/Qwen3_VL_2B
+./scripts/build_edgellm.sh
 cmake -S runtime_cpp -B runtime_cpp/build \
   -DCMAKE_BUILD_TYPE=Release \
   -DTRT_PACKAGE_DIR=/usr \
-  -DEDGELLM_SOURCE_DIR=/home/jetson/TensorRT-Edge-LLM \
-  -DEDGELLM_BUILD_DIR=/home/jetson/TensorRT-Edge-LLM/build-v0101
+  -DEDGELLM_SOURCE_DIR="$PWD/third_party/TensorRT-Edge-LLM" \
+  -DEDGELLM_BUILD_DIR="$PWD/third_party/TensorRT-Edge-LLM/build-v0101"
 cmake --build runtime_cpp/build -j2
 ```
 
@@ -26,7 +27,7 @@ export LD_LIBRARY_PATH="$TRT_PACKAGE_DIR/lib:$TRT_PACKAGE_DIR/lib/aarch64-linux-
 runtime_cpp/build/qwen3_vl_cli \
   --engine-dir models/engines-jetson-20260911-profiled/llm \
   --multimodal-engine-dir models/engines-jetson-20260911-profiled \
-  --plugin /home/jetson/TensorRT-Edge-LLM/build-v0101/libNvInfer_edgellm_plugin.so.1.0 \
+  --plugin third_party/TensorRT-Edge-LLM/build-v0101/libNvInfer_edgellm_plugin.so.1.0 \
   --image dataset/0.jpg \
   --prompt '请简短描述这张图片。' \
   --max-new-tokens 32

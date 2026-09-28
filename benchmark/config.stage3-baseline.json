@@ -6,8 +6,8 @@
     "nsys": "/usr/local/cuda-13.2/bin/nsys",
     "ncu": "/usr/local/cuda-13.2/bin/ncu",
     "plugin": "third_party/TensorRT-Edge-LLM/build-v0101/libNvInfer_edgellm_plugin.so.1.0",
-    "llm_engine_dir": "models/engines-jetson-20260911-profiled/llm",
-    "multimodal_engine_dir": "models/engines-jetson-20260911-profiled"
+    "llm_engine_dir": "models/engines-jetson-stage3-baseline-20260916/llm",
+    "multimodal_engine_dir": "models/engines-jetson-stage3-baseline-20260916"
   },
   "request": {
     "image": "dataset/0.jpg",
