@@ -137,6 +137,56 @@ shape、scale 和 INT4/FP16 布局，因此逻辑部署权重体积不增加。
 原文件按不可变输入处理；仅删掉一个硬链接不会破坏另一个，但原地改写会影响两边。
 不同磁盘时自动复制。实验输出是推理 checkpoint，不含可恢复训练的 Adam 状态。
 
+## 6. 公开训练数据：VQAv2 / The Cauldron
+
+第一轮采用 HuggingFaceM4/the_cauldron 的 `vqav2` train 子集。发布页列出
+82,772 张图片、443,757 个问答；每个记录包含 `images` 和 `texts`，方便
+直接落地，不必逐个请求外部图片 URL。它主要是英文、偏短答案的视觉问答，
+适合先检查当前 32 Token 预算下的 QAT 效果；中文业务仍需混合中文数据并单独验证。
+
+脚本只流式抽样指定数量、每图随机选一个满足长度限制的问答；保存原尺寸 PNG，
+后续继续由原来的 Qwen processor 处理到相同视觉 Token 范围。
+不会下载其他子集或主动下载完整 13.5 GB 的 vqav2。网络缓存/预取量仍取决于
+datasets/fsspec；流式抽样不表示只传输最终保存图片的大小。
+精确 RGB 内容重复的图片会被去重，且排除原有 final eval 的重复图片；重新压缩、
+裁切等近似重复不保证识别。
+
+数据准备不加载模型权重、不使用 CUDA。需要 `datasets`、`huggingface_hub`
+及现有 Transformers/Pillow；若缺 datasets，执行 `python -m pip install datasets`。
+
+```bash
+python server_opt_0101/prepare_public_qat.py \
+  --root . \
+  --config server_opt_0101/config.old-awq-int4-lmhead-mixed-proj-vision-fp16-blocks-residual-a07.json \
+  --exclude-eval outputs/manifests-formal-v1/eval.jsonl \
+  --samples 2048 \
+  --out dataset/qat-vqav2-v1
+```
+
+输出 `dataset/qat-vqav2-v1/train.jsonl`、`images/` 和 `DATASET_INFO.json`。
+元数据记录具体 Hub revision、筛选数量、来源和许可说明。已有输出目录会拒绝覆盖；
+准备失败时保留部分数据以便排查，不能把不完整文件当成已完成的数据集。
+
+运行短程检查后，正式 QAT 命令可用：
+
+```bash
+python server_opt_0101/qat_awq.py \
+  --root . \
+  --config server_opt_0101/config.old-awq-int4-lmhead-mixed-proj-vision-fp16-blocks-residual-a07.json \
+  --train dataset/qat-vqav2-v1/train.jsonl \
+  --eval outputs/manifests-formal-v1/eval.jsonl \
+  --scope head --init fp16-in-bin \
+  --train-samples 2048 --holdout-samples 64 \
+  --steps 200 --grad-accum 4 --lr 2e-5 --eval-every 25 \
+  --out outputs/qat-head-vqav2-v1
+```
+
+不加 `--diversify-prompts`；保留原问题及与之匹配的答案。
+这个训练会重新划分内部 holdout，指标必须与本轮 step 0 比较，不能直接与旧
+16 条 holdout 比较。原来 32 条 formal eval 仍留到最终复测。
+VQA 原始标注为 CC BY 4.0；图片应遵循其各自原始许可证，公开发布时保留来源。
+许可来源：[VQA Terms](https://visualqa.org/terms.html)。
+
 官方参考：
 [ModelOpt QAT 文档](https://github.com/NVIDIA/Model-Optimizer/blob/main/docs/source/guides/_pytorch_quantization.rst)、
 [0.45.0 INT4 打包实现](https://github.com/NVIDIA/Model-Optimizer/blob/0.45.0/modelopt/torch/export/quant_utils.py)。
