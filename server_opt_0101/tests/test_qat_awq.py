@@ -6,13 +6,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qat_awq import (make_qat_linear_class, select_trainable_modules,
-                     split_training_rows, answer_logits, distillation_loss)
+                     split_training_rows, answer_logits, distillation_loss,
+                     packed_change_summary)
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 MODELOPT_AVAILABLE = TORCH_AVAILABLE and importlib.util.find_spec("modelopt") is not None
 
 
 class QATDataTests(unittest.TestCase):
+    def test_actual_changed_values_are_counted_per_nibble(self):
+        import numpy as np
+        before = {"head": np.array([[0x01, 0x72, 0xFF]], dtype=np.uint8)}
+        after = {"head": np.array([[0x02, 0x82, 0x00]], dtype=np.uint8)}
+        result = packed_change_summary(before, after)
+        self.assertEqual(result["changed_packed_bytes"]["head"], 3)
+        self.assertEqual(result["changed_int4_values"]["head"], 4)
+        self.assertEqual(result["total_int4_values"], 6)
+        self.assertAlmostEqual(result["changed_fraction"], 4 / 6)
+        unchanged = packed_change_summary(before, before)
+        self.assertEqual(unchanged["total_changed_int4_values"], 0)
+
     def test_same_image_different_questions_cannot_cross_holdout(self):
         rows = []
         for i in range(10):
@@ -89,6 +102,26 @@ class QATTorchTests(unittest.TestCase):
         optimizer.step()
         layer.project()
         self.assertFalse(torch.equal(before, layer(x).detach()))
+
+    def test_fp16_in_bin_init_preserves_forward_but_reduces_rounding_barrier(self):
+        import torch
+        layer = self.toy()
+        x = torch.ones((1, 4), dtype=torch.float16)
+        before = layer(x).detach()
+        centers = layer.master_weight.detach().clone()
+        scales = layer.weight_scale.repeat_interleave(layer.group_size, dim=1)
+        original = (centers - 0.49 * scales) * layer.pre_quant_scale
+        layer.initialize_within_bins(original)
+        self.assertTrue(torch.equal(before, layer(x).detach()))
+        self.assertFalse(torch.equal(centers, layer.master_weight.detach()))
+        optimizer = torch.optim.SGD([layer.master_weight], lr=0.01)
+        layer(x).float().sum().backward()
+        optimizer.step()
+        layer.project()
+        self.assertFalse(torch.equal(before, layer(x).detach()))
+        diagnostics = layer.shadow_diagnostics()
+        self.assertGreater(diagnostics["mean_abs_subbin_offset"], 0)
+        self.assertLessEqual(diagnostics["max_abs_subbin_offset"], 0.50001)
 
     def test_teacher_no_grad_but_student_distillation_has_gradients(self):
         import torch

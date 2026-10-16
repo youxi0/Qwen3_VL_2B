@@ -6,6 +6,12 @@
 checkpoint 恢复 FP32 shadow weights，并保留原来的 group-128 scale 和
 `pre_quant_scale`。
 
+当前默认 `--init fp16-in-bin`：用原始 FP16 权重恢复量化区间内的位置，
+并限制在原 INT4 code 的 ±0.49 scale 范围内。训练前的 packed 字节和
+前向仍须与原 AWQ 完全一致。`--init centers` 可复现第一版的网格中心初始化。
+网格中心初始化需要累计移动半个量化步长才会改变 INT4 前向，小学习率、
+短程训练可能导致浮点参数变化而所有实际 INT4 编码都不变。
+
 - 教师：原始 FP16 Qwen3-VL-2B。
 - 学生：当前最佳的旧 AWQ + INT4 LM head + 6 个 FP16 回退投影。
 - 前向：权重除 group scale、round、clamp 到 [-8, 7]、反量化到 FP16。
@@ -80,12 +86,20 @@ print('baseline:', d.get('baseline'))
 print('best:', d.get('best_metrics'))
 print('holdout KL reduction:', d.get('holdout_kl_reduction'))
 print('changed packed bytes:', d.get('changed_packed_bytes'))
+print('last checkpoint INT4 changes:', d.get('last_quantization'))
+print('last checkpoint metrics:', d.get('last_metrics'))
 print('peak allocated MiB:', d.get('peak_cuda_allocated_mib'))
 PY
 ```
 
-只有浮点训练 loss 下降而 `changed_packed_bytes` 为 0，意味着实际 INT4 权重
-还没有改变，不能据此宣称量化精度恢复。holdout 改善仍需要最终验证集复测。
+`changed_packed_bytes` 和 `best_quantization` 统计最终选择的最佳 checkpoint。
+如果 `best_step=0`，它们必然为 0，不能据此判断最后一步是否训练有效。
+`last_quantization` 和 history 中每次评估的 `quantization` 统计当时实际
+INT4 编码的变化；`shadow` 记录浮点参数在量化区间内的偏移。
+如果实际编码为 0 变化但 shadow 偏移非零，说明参数动了但未跨过舍入门槛。
+若编码已经变化而 holdout 仍未改善，应检查过拟合、数据覆盖和学习率，不能
+继续按“没有更新”处理。各步 train loss 使用不同样本，不能只看最后两步升降。
+holdout 改善仍需要最终验证集复测。
 
 ## 4. 导出、完整精度复测
 

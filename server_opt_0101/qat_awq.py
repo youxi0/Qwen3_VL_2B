@@ -64,6 +64,39 @@ def select_trainable_modules(packed_names, scope):
     return sorted(names)
 
 
+def packed_change_summary(original, current):
+    """Count actual changed INT4 values, including two values in each byte."""
+    import numpy as np
+    if set(original) != set(current):
+        raise ValueError("Packed module sets differ")
+    changed_bytes, changed_codes = {}, {}
+    total_codes = 0
+    for name in sorted(original):
+        before, after = np.asarray(original[name]), np.asarray(current[name])
+        if (before.dtype != np.uint8 or after.dtype != np.uint8
+                or before.shape != after.shape):
+            raise ValueError(f"Packed shape/dtype mismatch: {name}")
+        left, right = before.reshape(-1), after.reshape(-1)
+        byte_count = code_count = 0
+        for start in range(0, left.size, 2**20):
+            delta = np.bitwise_xor(left[start:start + 2**20],
+                                   right[start:start + 2**20])
+            byte_count += int(np.count_nonzero(delta))
+            code_count += int(np.count_nonzero(delta & 15))
+            code_count += int(np.count_nonzero(delta >> 4))
+        changed_bytes[name] = byte_count
+        changed_codes[name] = code_count
+        total_codes += 2 * left.size
+    total_changed = sum(changed_codes.values())
+    return {
+        "changed_packed_bytes": changed_bytes,
+        "changed_int4_values": changed_codes,
+        "total_changed_int4_values": total_changed,
+        "total_int4_values": total_codes,
+        "changed_fraction": total_changed / total_codes if total_codes else 0.0,
+    }
+
+
 def make_qat_linear_class():
     import torch
     from torch import nn
@@ -111,6 +144,46 @@ def make_qat_linear_class():
             return functional.linear(inputs * self.pre_quant_scale, weight, self.bias)
 
         @torch.no_grad()
+        def initialize_within_bins(self, original_weight, margin=0.49):
+            """Recover FP16 residuals while strictly preserving every INT4 code.
+
+            Original W / AWQ input pre-scale is in the shadow-weight domain.
+            Clip it inside the existing code's bin rather than requantizing
+            the original model and losing the validated AWQ assignment.
+            """
+            if tuple(original_weight.shape) != tuple(self.master_weight.shape):
+                raise ValueError("FP16 source/QAT weight shape mismatch")
+            if not 0 < margin < 0.5:
+                raise ValueError("Initialization margin must be in (0, 0.5)")
+            for start in range(0, self.out_features, 256):
+                stop = min(start + 256, self.out_features)
+                weight = self.master_weight[start:stop]
+                scale = self.weight_scale[start:stop, :, None]
+                center = weight.reshape(stop - start, -1, self.group_size)
+                original = (original_weight[start:stop].float()
+                            / self.pre_quant_scale.float()[None, :])
+                original = original.reshape_as(center)
+                if not torch.isfinite(original).all():
+                    raise ValueError("Non-finite FP16 within-bin initialization")
+                center.copy_(torch.maximum(
+                    torch.minimum(original, center + margin * scale),
+                    center - margin * scale))
+            self.project()
+
+        @torch.no_grad()
+        def shadow_diagnostics(self):
+            total = maximum = 0.0
+            for start in range(0, self.out_features, 256):
+                grouped = self.master_weight[start:start + 256].reshape(
+                    -1, self.in_features // self.group_size, self.group_size)
+                normalized = grouped / self.weight_scale[start:start + 256, :, None]
+                offset = (normalized - normalized.round()).abs()
+                total += offset.sum().item()
+                maximum = max(maximum, offset.max().item())
+            return {"mean_abs_subbin_offset": total / self.master_weight.numel(),
+                    "max_abs_subbin_offset": maximum}
+
+        @torch.no_grad()
         def project(self):
             grouped = self.master_weight.reshape(self.out_features, -1, self.group_size)
             bound = self.weight_scale[:, :, None]
@@ -126,7 +199,7 @@ def make_qat_linear_class():
     return QATLinear
 
 
-def install_qat_modules(model, cfg, names):
+def install_qat_modules(model, cfg, names, teacher=None, init_mode="centers"):
     import torch
     from torch_work import TensorStore, replace_named_submodule
     QATLinear = make_qat_linear_class()
@@ -140,6 +213,12 @@ def install_qat_modules(model, cfg, names):
             scales = source.get(name + ".weight_scale").to("cuda", dtype=torch.float32)
             pre_scale = source.get(name + ".pre_quant_scale").to("cuda")
             layer = QATLinear(packed, scales, pre_scale, old.bias, group)
+            if init_mode == "fp16-in-bin":
+                if teacher is None:
+                    raise ValueError("FP16 within-bin initialization requires the teacher")
+                layer.initialize_within_bins(teacher.get_submodule(name).weight)
+            elif init_mode != "centers":
+                raise ValueError(f"Unknown QAT initialization: {init_mode}")
             if not torch.equal(layer.packed_weight(), packed.cpu()):
                 raise ValueError(f"QAT initialization does not reproduce AWQ bytes: {name}")
             replace_named_submodule(model, name, layer)
@@ -285,6 +364,9 @@ def main():
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--init", choices=["centers", "fp16-in-bin"],
+                        default="fp16-in-bin",
+                        help="Shadow initialization; both modes preserve AWQ step-zero bytes")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--ce-weight", type=float, default=0.0,
                         help="Optional answer CE mixture; default is teacher KL only")
@@ -356,7 +438,7 @@ def main():
         student, _ = load_awq_reference(cfg)
         references = build_holdout_references(teacher, processor, holdout, cfg)
         baseline = score_holdout(student, processor, references, cfg)
-        modules = install_qat_modules(student, cfg, names)
+        modules = install_qat_modules(student, cfg, names, teacher, args.init)
         # Both the packed bytes and held-out forward must match at step zero.
         initialized = score_holdout(student, processor, references, cfg)
         if any(abs(initialized[key] - baseline[key]) > 1e-6 for key in METRIC_KEYS):
@@ -371,7 +453,8 @@ def main():
             student.enable_input_require_grads()
         student.config.use_cache = False
         best_kl = baseline["teacher_kl"]
-        best_packed = snapshot_packed(modules)
+        original_packed = snapshot_packed(modules)
+        best_packed = original_packed
         best_metrics = baseline
         report.update({"status": "training", "baseline": baseline,
                        "step_zero": initialized,
@@ -445,12 +528,26 @@ def main():
             if step % args.eval_every == 0 or step == args.steps:
                 metrics = score_holdout(student, processor, references, cfg)
                 record["holdout"] = metrics
+                current_packed = snapshot_packed(modules)
+                changes = packed_change_summary(original_packed, current_packed)
+                record["quantization"] = changes
+                record["shadow"] = {
+                    name: module.shadow_diagnostics()
+                    for name, module in modules.items()
+                }
                 print(f"[QAT holdout {step}] {metrics}", flush=True)
+                print(f"[QAT INT4 {step}] changed values="
+                      f"{changes['total_changed_int4_values']}/"
+                      f"{changes['total_int4_values']} "
+                      f"({changes['changed_fraction']:.6%})", flush=True)
                 if metrics["teacher_kl"] < best_kl:
                     best_kl = metrics["teacher_kl"]
                     best_metrics = metrics
-                    best_packed = snapshot_packed(modules)
+                    best_packed = current_packed
                     report["best_step"] = step
+                report["last_quantization"] = changes
+                report["last_metrics"] = metrics
+                del current_packed
             report["history"].append(record)
             write_json(report_path, report)
 
@@ -459,18 +556,9 @@ def main():
                        "improved_on_holdout": report["best_step"] > 0,
                        "successful_updates": successful_updates,
                        "peak_cuda_allocated_mib": torch.cuda.max_memory_allocated() / 2**20})
-        from torch_work import TensorStore
-        original_weights = TensorStore(cfg["awq"])
-        try:
-            changed = {}
-            for name, packed in best_packed.items():
-                old = original_weights.get(name + ".weight")
-                # Count changed bytes as a compact check that trained FP32
-                # shadows actually crossed quantization bins before export.
-                changed[name] = int((old != packed).sum().item())
-            report["changed_packed_bytes"] = changed
-        finally:
-            original_weights.close()
+        best_changes = packed_change_summary(original_packed, best_packed)
+        report["changed_packed_bytes"] = best_changes["changed_packed_bytes"]
+        report["best_quantization"] = best_changes
         checkpoint = output / "checkpoint"
         export_checkpoint(cfg, best_packed, checkpoint)
         next_cfg = dict(cfg)
