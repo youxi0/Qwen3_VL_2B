@@ -184,6 +184,31 @@ python server_opt_0101/qat_awq.py \
 不加 `--diversify-prompts`；保留原问题及与之匹配的答案。
 这个训练会重新划分内部 holdout，指标必须与本轮 step 0 比较，不能直接与旧
 16 条 holdout 比较。原来 32 条 formal eval 仍留到最终复测。
+
+### 原验证图片已删除时
+
+直接从公开数据另留 128 张固定验证图片，不再读取已删除的原验证集：
+
+```bash
+python server_opt_0101/prepare_public_qat.py \
+  --root . \
+  --config server_opt_0101/config.old-awq-int4-lmhead-mixed-proj-vision-fp16-blocks-residual-a07.json \
+  --samples 2048 --eval-samples 128 \
+  --out dataset/qat-vqav2-new-v1
+```
+
+生成 `train.jsonl`（2048 张图片）和 `eval.jsonl`（128 张其他图片），
+两者不共享完全相同的 RGB 图片。它们均抽自 VQAv2 的 train 数据，这里的
+eval 是本实验固定留出集，不是官方 benchmark test split。
+
+后续 QAT 使用 `--train dataset/qat-vqav2-new-v1/train.jsonl` 与
+`--eval dataset/qat-vqav2-new-v1/eval.jsonl`。内部的64条 holdout仍从
+2048条 train 中划出，用于选训练步数。新的128条 eval仅用于最终对比。
+完整 pipeline 可用这份 train 作为 `--calib`，但重新校准 Vision 会读取全部
+记录，耗时会增加；也可以另外保留一个固定的、与新 eval 无交集的校准子集。
+必须在新的固定128条 eval上同时跑 QAT 起点与训练后权重，不能把新指标和已
+删除的原32条 eval历史指标直接对比。
+
 VQA 原始标注为 CC BY 4.0；图片应遵循其各自原始许可证，公开发布时保留来源。
 许可来源：[VQA Terms](https://visualqa.org/terms.html)。
 

@@ -68,6 +68,27 @@ class PublicQATTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 materialize(rows, FixtureProcessor(), cfg, output, 2, set(), 42)
 
+    def test_new_eval_uses_different_images_from_training(self):
+        from common import check_splits
+        images = [Image.new("RGB", (8, 8), (i * 20, 0, 0)) for i in range(6)]
+        rows = [{"images": [image], "texts": [
+            {"user": "What color?", "assistant": "red"}
+        ]} for image in images]
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "new-eval"
+            stats = materialize(rows, FixtureProcessor(), {
+                "max_new_tokens": 4, "max_input_tokens": 32,
+            }, output, 4, set(), 42, eval_samples=2)
+            train = read_manifest(output / "train.jsonl", require_image=True)
+            evaluation = read_manifest(output / "eval.jsonl", require_image=True)
+            self.assertEqual(len(train), 4)
+            self.assertEqual(len(evaluation), 2)
+            self.assertEqual(stats["train_saved"], 4)
+            self.assertEqual(stats["eval_saved"], 2)
+            check_splits(train, evaluation)
+            self.assertFalse({row["image"] for row in train}
+                             & {row["image"] for row in evaluation})
+
 
 if __name__ == "__main__":
     unittest.main()
