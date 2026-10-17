@@ -62,7 +62,8 @@ def main():
     output.mkdir(parents=True)
     write_json(output / "evaluation.json", {
         "config": cfg, "evaluation": rows, "environment": environment,
-        "layout": layout, "calibration_performed": False, "training_performed": False,
+        "layout": {**layout, "packed_modules": sorted(layout["packed_modules"])},
+        "calibration_performed": False, "training_performed": False,
         "vision_precision": "FP16", "engine_verified": False, "jetson_fit_verified": False,
     })
     teacher = candidate = references = None

@@ -444,7 +444,7 @@ def main():
         "method": "Fixed-grid W4A16 STE quantization-aware distillation",
         "scope": args.scope, "source_awq": cfg["awq"],
         "source_config": dict(cfg),
-        "source_layout": layout,
+        "source_layout": {**layout, "packed_modules": sorted(layout["packed_modules"])},
         "answer_source": args.answer_source,
         "metric_note": "Teacher consistency on the selected continuation, not VQA task accuracy. "
                        "Compare only runs with identical data, split and answer_source.",
