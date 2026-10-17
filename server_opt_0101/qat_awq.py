@@ -257,29 +257,48 @@ def distillation_loss(student, teacher, tokens, temperature, ce_weight):
     return (1 - ce_weight) * kl + ce_weight * ce, kl.detach(), ce.detach()
 
 
-def get_answer_tokens(teacher, processor, inputs, row, cfg):
-    import torch
+def get_answer_tokens(teacher, processor, inputs, row, cfg, answer_source="dataset"):
+    """Choose the continuation without changing the original manifest/answers.
+
+    Teacher mode deliberately ignores annotated answers for recovery training.
+    Dataset mode retains the old behavior, generating only when no answer exists.
+    """
     from torch_work import greedy
-    if row.get("answer", "").strip():
+    if answer_source not in ("dataset", "teacher"):
+        raise ValueError(f"Unknown answer source: {answer_source}")
+    if answer_source == "dataset" and row.get("answer", "").strip():
+        import torch
         ids = processor.tokenizer.encode(row["answer"], add_special_tokens=False)
         if not ids or len(ids) > cfg["max_new_tokens"]:
             raise ValueError(
                 f"{row['id']}: answer length {len(ids)} exceeds the configured "
                 f"1..{cfg['max_new_tokens']}; shorten it or raise max_new_tokens")
         return torch.tensor([ids], dtype=torch.long, device="cuda")
-    return greedy(teacher, inputs, cfg).clone()
+    tokens = greedy(teacher, inputs, cfg).clone()
+    if tokens.ndim != 2 or tokens.shape[0] != 1 or not 1 <= tokens.shape[1] <= cfg["max_new_tokens"]:
+        raise ValueError(f"{row['id']}: teacher returned an invalid continuation")
+    return tokens
 
 
-def build_holdout_references(teacher, processor, rows, cfg):
+def build_holdout_references(teacher, processor, rows, cfg,
+                             answer_source="dataset", label="holdout"):
     from torch_work import prepare_inputs
     references = []
     for index, row in enumerate(rows):
-        print(f"[QAT holdout teacher {index + 1}/{len(rows)}] {row['id']}", flush=True)
+        print(f"[QAT {label} teacher {index + 1}/{len(rows)}] {row['id']}", flush=True)
         inputs = prepare_inputs(processor, row, cfg)
-        tokens = get_answer_tokens(teacher, processor, inputs, row, cfg)
+        tokens = get_answer_tokens(teacher, processor, inputs, row, cfg, answer_source)
         logits = answer_logits(teacher, inputs, tokens)
         references.append({"row": row, "tokens": tokens.cpu(), "logits": logits.cpu()})
     return references
+
+
+def reference_token_summary(references):
+    lengths = [int(reference["tokens"].shape[1]) for reference in references]
+    return {"samples": len(lengths), "tokens": sum(lengths),
+            "mean_answer_tokens": sum(lengths) / len(lengths) if lengths else 0,
+            "min_answer_tokens": min(lengths) if lengths else 0,
+            "max_answer_tokens": max(lengths) if lengths else 0}
 
 
 def score_holdout(model, processor, references, cfg):
@@ -370,6 +389,10 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--ce-weight", type=float, default=0.0,
                         help="Optional answer CE mixture; default is teacher KL only")
+    parser.add_argument("--answer-source", choices=["dataset", "teacher"], default="dataset",
+                        help="Continuation for both train/holdout; teacher ignores annotated answers")
+    parser.add_argument("--train-probe-samples", type=int, default=0,
+                        help="Fixed training subset to rescore at baseline/every eval; never selects checkpoints")
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--diversify-prompts", action="store_true")
     parser.add_argument("--out", type=Path, required=True,
@@ -378,7 +401,7 @@ def main():
     if (min(args.steps, args.grad_accum, args.eval_every, args.train_samples) < 1
             or not math.isfinite(args.lr) or args.lr <= 0
             or not math.isfinite(args.temperature) or args.temperature <= 0
-            or not 0 <= args.ce_weight <= 1):
+            or not 0 <= args.ce_weight <= 1 or args.train_probe_samples < 0):
         parser.error("Invalid steps/accumulation/LR/temperature/CE settings")
     output = args.out.expanduser().resolve()
     if output.exists():
@@ -389,6 +412,8 @@ def main():
     evaluation = read_manifest(args.eval)
     train, holdout = split_training_rows(
         rows, evaluation, args.holdout_samples, args.train_samples, cfg["seed"])
+    if args.train_probe_samples > len(train):
+        parser.error("--train-probe-samples exceeds the actual training row count")
     diversified = 0
     if args.diversify_prompts:
         from requantize_awq_lm_head import diversify_repeated_questions
@@ -418,6 +443,11 @@ def main():
         "status": "initializing", "experimental": True,
         "method": "Fixed-grid W4A16 STE quantization-aware distillation",
         "scope": args.scope, "source_awq": cfg["awq"],
+        "source_config": dict(cfg),
+        "source_layout": layout,
+        "answer_source": args.answer_source,
+        "metric_note": "Teacher consistency on the selected continuation, not VQA task accuracy. "
+                       "Compare only runs with identical data, split and answer_source.",
         "train_rows": train, "holdout_rows": holdout,
         "diversified_prompts": diversified, "trained_modules": names,
         "settings": {key: str(value) if isinstance(value, Path) else value
@@ -429,15 +459,21 @@ def main():
     }
     report_path = output / "qat_report.json"
     write_json(report_path, report)
-    teacher = student = references = optimizer = modules = None
+    teacher = student = references = probe_references = optimizer = modules = None
     try:
         processor = make_processor(cfg)
         tokenizer_check(cfg, processor)
         print("Loading frozen FP16 teacher and validated AWQ student...", flush=True)
         teacher = load_fp16(cfg["original"])
         student, _ = load_awq_reference(cfg)
-        references = build_holdout_references(teacher, processor, holdout, cfg)
+        references = build_holdout_references(
+            teacher, processor, holdout, cfg, args.answer_source)
+        probe_references = build_holdout_references(
+            teacher, processor, train[:args.train_probe_samples], cfg,
+            args.answer_source, label="train probe")
         baseline = score_holdout(student, processor, references, cfg)
+        baseline_probe = (score_holdout(student, processor, probe_references, cfg)
+                          if probe_references else None)
         modules = install_qat_modules(student, cfg, names, teacher, args.init)
         # Both the packed bytes and held-out forward must match at step zero.
         initialized = score_holdout(student, processor, references, cfg)
@@ -458,12 +494,22 @@ def main():
         best_metrics = baseline
         report.update({"status": "training", "baseline": baseline,
                        "step_zero": initialized,
+                       "baseline_train_probe": baseline_probe,
+                       "holdout_token_summary": reference_token_summary(references),
+                       "train_probe_token_summary": reference_token_summary(probe_references),
+                       "train_probe_ids": [reference["row"]["id"] for reference in probe_references],
                        "trainable_parameters": sum(p.numel() for p in parameters)})
         write_json(report_path, report)
         print(f"QAT baseline: {baseline}", flush=True)
+        print(f"QAT answer source: {args.answer_source}; "
+              f"holdout tokens: {report['holdout_token_summary']}", flush=True)
+        if baseline_probe is not None:
+            print(f"[QAT train probe 0] {baseline_probe}", flush=True)
         print(f"Trainable INT4 modules: {len(names)}; parameters: "
               f"{report['trainable_parameters']:,}", flush=True)
-        token_cache = {}
+        # Teacher continuations of probe rows are identical in training/scoring.
+        token_cache = {index: reference["tokens"]
+                       for index, reference in enumerate(probe_references)}
         rng = random.Random(cfg["seed"])
         schedule = []
         consecutive_overflows = 0
@@ -489,7 +535,8 @@ def main():
                 row = train[row_index]
                 inputs = prepare_inputs(processor, row, cfg)
                 if row_index not in token_cache:
-                    tokens = get_answer_tokens(teacher, processor, inputs, row, cfg)
+                    tokens = get_answer_tokens(
+                        teacher, processor, inputs, row, cfg, args.answer_source)
                     token_cache[row_index] = tokens.cpu()
                 tokens = token_cache[row_index].to("cuda")
                 teacher_logits = answer_logits(teacher, inputs, tokens)
@@ -528,6 +575,11 @@ def main():
             if step % args.eval_every == 0 or step == args.steps:
                 metrics = score_holdout(student, processor, references, cfg)
                 record["holdout"] = metrics
+                if probe_references:
+                    probe_metrics = score_holdout(student, processor, probe_references, cfg)
+                    record["train_probe"] = probe_metrics
+                    report["last_train_probe"] = probe_metrics
+                    print(f"[QAT train probe {step}] {probe_metrics}", flush=True)
                 current_packed = snapshot_packed(modules)
                 changes = packed_change_summary(original_packed, current_packed)
                 record["quantization"] = changes
@@ -580,7 +632,7 @@ def main():
             pass
         raise
     finally:
-        teacher = student = references = optimizer = modules = None
+        teacher = student = references = probe_references = optimizer = modules = None
         release_cuda()
 
 

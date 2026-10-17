@@ -23,6 +23,68 @@ checkpoint 恢复 FP32 shadow weights，并保留原来的 group-128 scale 和
 这条路线会实际调整部署的 INT4 字节，不需要额外运行时 LoRA。
 已量化文件不能直接传给普通 HF Trainer 作为可训练浮点权重。
 
+## 当前推荐流程：旧 PTQ 在新数据上复测，再做 QAD 诊断
+
+保留现有 `outputs/Qwen3-VL-2B-OLD-AWQ-INT4-LMHEAD-MIXED-v0101`
+作为不可变输入；不重新 AWQ、不覆盖它。其校准来自旧数据，后续扩充训练集不会
+自动改变这个 checkpoint。换数据不表示旧 PTQ 必须作废，但必须重新评估适用性。
+配置中的 Vision 仍为 residual_fp16、alpha=0.7、blocks 0/4/5/11 FP16。
+
+历史旧32图上，混合 LLM + FP16 Vision Top1=0.8125 / KL=0.148966；
+组合混合 Vision Top1=0.814453 / KL=0.153002；估算3278.4MiB。
+这些仅支持“保留为实验基线”，不代表官方 VQA 准确率或 Jetson 部署已验收。
+旧图片已删除，不能直接与新128图或 QAT内部64图的数字横向比较。
+
+### A. 只评测新固定验证集，不训练、不校准
+
+```bash
+python server_opt_0101/evaluate_llm.py \
+  --root . \
+  --config server_opt_0101/config.old-awq-int4-lmhead-mixed-proj-vision-fp16-blocks-residual-a07.json \
+  --eval dataset/qat-vqav2-new-v1/eval.jsonl \
+  --out outputs/eval-ptq-mixed-vqav2-v1
+```
+
+使用新清单全部128条，不受配置 `evaluation_samples=32` 截断。
+此步骤隔离 LLM，Vision 始终FP16，不重新量化 Vision。
+报告 `alignment.json` 保存每条问题、FP16回答、候选回答、人工答案与指标；
+`summary.json` 保存全局指标。KL/Top1 沿FP16生成序列计算；人工答案上的NLL另列。
+同时输出两个模型相对单个标注答案的严格文本匹配数，这不是官方VQAv2多标注评分，
+也可能因回答措辞而偏低，须结合生成文本与后续实际任务评估判断。
+最终验证集不用于调学习率或挑步数；需要迭代的选择仍用训练内部holdout。
+将来对 QAT `config.qat.json` 运行同一脚本，可作同口径最终比较。
+
+### B. 先验证能否拟合固定8个训练样本
+
+```bash
+python server_opt_0101/qat_awq.py \
+  --root . \
+  --config server_opt_0101/config.old-awq-int4-lmhead-mixed-proj-vision-fp16-blocks-residual-a07.json \
+  --train dataset/qat-vqav2-new-v1/train.jsonl \
+  --eval dataset/qat-vqav2-new-v1/eval.jsonl \
+  --scope all --init fp16-in-bin --answer-source teacher \
+  --train-samples 8 --holdout-samples 64 --train-probe-samples 8 \
+  --steps 30 --grad-accum 4 --lr 3e-6 --eval-every 5 \
+  --out outputs/qat-teacher-fit8-v1
+```
+
+`--answer-source teacher` 让训练和内部holdout都沿FP16教师生成的回答蒸馏，
+最多32个新token，EOS提前结束；不保证比人工答案长。原JSONL及人工答案不改写。
+默认仍为 `dataset`，保持旧命令行为。不是增加人工答案CE权重，默认仍是纯KL。
+固定训练probe的教师token与实际训练token复用，复测时模型eval模式、无梯度。
+训练和probe是同8条；内部64条holdout不参与反传；最终128条eval只检测泄漏。
+
+关注 `[QAT train probe 0/5/10/...]` 的KL是否相对自身step0下降。
+若训练probe下降、holdout上升，才有小样本泛化不足的证据；若两者都不降，
+先排查优化和舍入，不直接扩训练量。这是诊断实验，不是部署候选验收。
+checkpoint仍只按内部holdout最低KL选取，绝不按训练probe或最终eval选择；
+若无改善仍输出step0。教师序列变了，不能直接比较之前人工答案路径的0.21667。
+
+`qat_report.json` 新增 `answer_source`、`source_config`、`source_layout`、
+`baseline_train_probe`、`last_train_probe` 和每次history的 `train_probe`。
+当前仍冻结scale/pre-scale；冻结scale本身是常见QAT方案，不能据此认定实现错误。
+本轮尚未加入可学习scale，也没有证明QAT一定会恢复精度。
+
 ## 1. 先跑环境/训练检查
 
 使用原来的 base 环境，不新增训练框架、不升级 ModelOpt。

@@ -3,17 +3,77 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qat_awq import (make_qat_linear_class, select_trainable_modules,
                      split_training_rows, answer_logits, distillation_loss,
-                     packed_change_summary)
+                     packed_change_summary, get_answer_tokens,
+                     build_holdout_references, reference_token_summary)
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 MODELOPT_AVAILABLE = TORCH_AVAILABLE and importlib.util.find_spec("modelopt") is not None
 
 
 class QATDataTests(unittest.TestCase):
+    def test_default_answer_mode_preserves_annotation_behavior(self):
+        processor = Mock()
+        processor.tokenizer.encode.return_value = [2, 3]
+        fake_torch = SimpleNamespace(tensor=Mock(), long="long")
+        with patch.dict(sys.modules, {"torch": fake_torch}), \
+                patch("torch_work.greedy") as greedy:
+            result = get_answer_tokens("teacher", processor, {},
+                                       {"id": "a", "answer": "two"}, {"max_new_tokens": 32})
+        processor.tokenizer.encode.assert_called_once_with("two", add_special_tokens=False)
+        fake_torch.tensor.assert_called_once_with([[2, 3]], dtype="long", device="cuda")
+        self.assertIs(result, fake_torch.tensor.return_value)
+        greedy.assert_not_called()
+
+    def test_teacher_answer_mode_ignores_annotations_without_modifying_row(self):
+        row = {"id": "a", "answer": "human answer"}
+        tokens = SimpleNamespace(ndim=2, shape=(1, 3))
+        generated = Mock()
+        generated.clone.return_value = tokens
+        processor = Mock()
+        with patch("torch_work.greedy", return_value=generated) as greedy:
+            result = get_answer_tokens("teacher", processor, {"prompt": 1}, row,
+                                       {"max_new_tokens": 32}, "teacher")
+        self.assertIs(result, tokens)
+        greedy.assert_called_once()
+        processor.tokenizer.encode.assert_not_called()
+        self.assertEqual(row["answer"], "human answer")
+
+    def test_invalid_answer_source_and_empty_teacher_response_rejected(self):
+        cfg = {"max_new_tokens": 32}
+        with self.assertRaisesRegex(ValueError, "Unknown answer source"):
+            get_answer_tokens(None, None, {}, {"id": "a"}, cfg, "invalid")
+        generated = Mock()
+        generated.clone.return_value = SimpleNamespace(ndim=2, shape=(1, 0))
+        with patch("torch_work.greedy", return_value=generated):
+            with self.assertRaisesRegex(ValueError, "invalid continuation"):
+                get_answer_tokens(None, None, {}, {"id": "a"}, cfg, "teacher")
+
+    def test_reference_builder_passes_answer_policy_and_keeps_fixed_tokens(self):
+        tokens, logits = Mock(), Mock()
+        row, cfg = {"id": "a", "answer": "annotation"}, {"max_new_tokens": 32}
+        with patch("torch_work.prepare_inputs", return_value={"prompt": 1}), \
+                patch("qat_awq.get_answer_tokens", return_value=tokens) as choose, \
+                patch("qat_awq.answer_logits", return_value=logits):
+            result = build_holdout_references(
+                "teacher", "processor", [row], cfg, "teacher", "train probe")
+        choose.assert_called_once_with("teacher", "processor", {"prompt": 1},
+                                       row, cfg, "teacher")
+        self.assertIs(result[0]["tokens"], tokens.cpu.return_value)
+        self.assertIs(result[0]["logits"], logits.cpu.return_value)
+
+    def test_answer_token_summary_includes_lengths(self):
+        references = [{"tokens": SimpleNamespace(shape=(1, count))} for count in (2, 6)]
+        self.assertEqual(reference_token_summary(references), {
+            "samples": 2, "tokens": 8, "mean_answer_tokens": 4,
+            "min_answer_tokens": 2, "max_answer_tokens": 6})
+        self.assertEqual(reference_token_summary([])["tokens"], 0)
+
     def test_actual_changed_values_are_counted_per_nibble(self):
         import numpy as np
         before = {"head": np.array([[0x01, 0x72, 0xFF]], dtype=np.uint8)}
