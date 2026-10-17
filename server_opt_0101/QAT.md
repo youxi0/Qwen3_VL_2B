@@ -1,6 +1,8 @@
 # W4A16 QAT / 量化感知蒸馏试验
 
 适用当前 Qwen3-VL-2B、ModelOpt 0.45.0 和 Edge-LLM 0.10.1。
+当前已完成512条QAD试验，独立、多任务PTQ/QAT对照入口见
+[INDEPENDENT_EVAL.md](INDEPENDENT_EVAL.md)。该阶段不增加训练步数。
 `qat_awq.py` 是本项目的实验训练实现。NVIDIA 文档介绍的 QAT 思路是
 在模拟量化前向中微调浮点权重；这里针对已经打包、未保存训练态的 AWQ
 checkpoint 恢复 FP32 shadow weights，并保留原来的 group-128 scale 和

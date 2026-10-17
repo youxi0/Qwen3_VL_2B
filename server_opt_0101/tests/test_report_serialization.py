@@ -18,6 +18,8 @@ class ReportSerializationTests(unittest.TestCase):
     def fixture(self, root):
         cfg = {key: str(root / key) for key in ("original", "awq", "awq_onnx", "images")}
         cfg["seed"] = 42
+        cfg.update(min_image_tokens=16, max_image_tokens=64,
+                   max_input_tokens=256, max_new_tokens=32)
         fp16 = {
             "model.language_model.layers.13.self_attn.o_proj",
             "model.language_model.layers.16.self_attn.q_proj",
@@ -81,6 +83,39 @@ class ReportSerializationTests(unittest.TestCase):
             self.assert_layout(report["layout"], original)
             self.assertFalse(report["training_performed"])
             self.assertFalse(report["calibration_performed"])
+
+    def test_full_mock_evaluation_writes_normalized_scores_and_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg, index, torch = self.fixture(root)
+            output = root / "reports"
+            rows = [{"id": "eval", "question": "Color?", "answer": "Red.",
+                     "image_sha256": "image-hash", "source_subset": "textvqa"}]
+            scores = {"metrics": {"teacher_kl": 0.1}, "samples": [{
+                "id": "eval", "reference_text": "red", "candidate_text": "RED",
+                "ground_truth_answer": "Red.", "ground_truth_exact_match": False,
+                "generation_exact_match_to_fp16": False}]}
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(sys, "argv", ["evaluate_llm", "--config", "config.json",
+                    "--eval", "eval.jsonl", "--out", str(output)]))
+                stack.enter_context(patch.dict(sys.modules, {"torch": torch}))
+                for name, value in [("load_config", cfg), ("read_manifest", rows),
+                                    ("versions", {}), ("checkpoint_index", index)]:
+                    stack.enter_context(patch.object(evaluate_llm, name, return_value=value))
+                for name in ("make_processor", "tokenizer_check", "load_fp16", "release_cuda"):
+                    stack.enter_context(patch(f"torch_work.{name}"))
+                stack.enter_context(patch("torch_work.load_awq_reference", return_value=(Mock(), [])))
+                stack.enter_context(patch("torch_work.create_references", return_value=[]))
+                stack.enter_context(patch("torch_work.evaluate_candidate", return_value=scores))
+                evaluate_llm.main()
+            summary = json.loads((output / "summary.json").read_text())
+            alignment = json.loads((output / "alignment.json").read_text())
+            self.assertEqual(summary["candidate_single_answer_exact"], 0)
+            self.assertEqual(summary["candidate_normalized_exact"], 1)
+            self.assertEqual(summary["fp16_normalized_exact"], 1)
+            self.assertEqual(alignment["samples"][0]["source_subset"], "textvqa")
+            self.assertEqual(len(alignment["evaluation_fingerprint"]), 64)
+            self.assertEqual(alignment["evaluation_settings"]["max_image_tokens"], 64)
 
     def test_qat_initial_report_serializes_real_mixed_layout(self):
         with tempfile.TemporaryDirectory() as directory:

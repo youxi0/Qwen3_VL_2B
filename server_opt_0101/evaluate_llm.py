@@ -11,6 +11,7 @@ from pathlib import Path
 
 from common import (checkpoint_index, inspect_awq_modules, load_config,
                     read_manifest, versions, write_json)
+from quality_metrics import NORMALIZATION, evaluation_fingerprint, normalize_answer
 
 
 def generation_summary(samples):
@@ -23,6 +24,13 @@ def generation_summary(samples):
             row["reference_text"].strip() == row["ground_truth_answer"].strip()
             for row in annotated),
         "candidate_single_answer_exact": sum(row["ground_truth_exact_match"] for row in annotated),
+        "fp16_normalized_exact": sum(
+            normalize_answer(row["reference_text"]) == normalize_answer(row["ground_truth_answer"])
+            for row in annotated),
+        "candidate_normalized_exact": sum(
+            normalize_answer(row["candidate_text"]) == normalize_answer(row["ground_truth_answer"])
+            for row in annotated),
+        "normalization": NORMALIZATION,
         "note": "Single-answer, case-sensitive stripped-text exact match only; "
                 "NOT official VQAv2 multi-annotator accuracy. Inspect generated text too.",
     }
@@ -78,6 +86,12 @@ def main():
         candidate, _ = load_awq_reference(cfg)
         scores = evaluate_candidate(candidate, processor, references, cfg,
                                     "Existing mixed LLM + FP16 Vision")
+        scores["evaluation_fingerprint"] = evaluation_fingerprint(rows)
+        scores["evaluation_settings"] = {key: cfg[key] for key in (
+            "original", "min_image_tokens", "max_image_tokens", "max_input_tokens", "max_new_tokens")}
+        manifest_by_id = {row["id"]: row for row in rows}
+        for sample in scores["samples"]:
+            sample["source_subset"] = manifest_by_id[sample["id"]].get("source_subset", "unspecified")
         summary = generation_summary(scores["samples"])
         write_json(output / "alignment.json", scores)
         write_json(output / "summary.json", {"metrics": scores["metrics"], **summary})
@@ -88,6 +102,9 @@ def main():
         print("Single-annotation exact (NOT official VQA accuracy): "
               f"FP16={summary['fp16_single_answer_exact']}/{summary['annotated_sample_count']}, "
               f"candidate={summary['candidate_single_answer_exact']}/{summary['annotated_sample_count']}")
+        print("Normalized single-answer exact (proxy): "
+              f"FP16={summary['fp16_normalized_exact']}/{summary['annotated_sample_count']}, "
+              f"candidate={summary['candidate_normalized_exact']}/{summary['annotated_sample_count']}")
         print(f"Reports: {output}")
     except Exception as exc:
         try:

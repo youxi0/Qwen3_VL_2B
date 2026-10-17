@@ -9,9 +9,9 @@ from evaluate_llm import generation_summary
 class EvaluationSummaryTests(unittest.TestCase):
     def test_single_annotation_exact_is_not_teacher_agreement(self):
         samples = [
-            {"reference_text": " two ", "ground_truth_answer": "two",
+            {"reference_text": " two ", "candidate_text": "three", "ground_truth_answer": "two",
              "ground_truth_exact_match": False, "generation_exact_match_to_fp16": False},
-            {"reference_text": "three", "ground_truth_answer": "two",
+            {"reference_text": "three", "candidate_text": " two ", "ground_truth_answer": "two",
              "ground_truth_exact_match": True, "generation_exact_match_to_fp16": False},
             {"reference_text": "unannotated", "generation_exact_match_to_fp16": True},
         ]
@@ -21,6 +21,8 @@ class EvaluationSummaryTests(unittest.TestCase):
         self.assertEqual(result["fp16_single_answer_exact"], 1)
         self.assertEqual(result["candidate_single_answer_exact"], 1)
         self.assertEqual(result["generation_exact_to_fp16"], 1)
+        self.assertEqual(result["fp16_normalized_exact"], 1)
+        self.assertEqual(result["candidate_normalized_exact"], 1)
         self.assertIn("NOT official", result["note"])
 
     def test_no_annotations_has_no_fake_denominator(self):
